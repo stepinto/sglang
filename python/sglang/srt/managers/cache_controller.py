@@ -251,6 +251,7 @@ class HiCacheController:
         load_cache_event: threading.Event,
         attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
         attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
@@ -264,7 +265,9 @@ class HiCacheController:
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
+        self.pp_group = pp_group
         self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.prefetch_sync_groups2: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -350,12 +353,17 @@ class HiCacheController:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         self.prefetch_sync_groups = []
+        self.prefetch_sync_groups2 = []
         seen_rank_sets = set()
 
         if self.attn_cp_group is not None or self.attn_tp_group is not None:
             base_groups = [self.attn_cp_group, self.attn_tp_group]
         else:
             base_groups = [self.tp_group]
+
+        # HACK(chaoshi)
+        if self.pp_group is not None:
+            base_groups.append(self.pp_group)
 
         for group in base_groups:
             if group is None or torch.distributed.get_world_size(group=group) == 1:
@@ -365,6 +373,11 @@ class HiCacheController:
                 continue
             seen_rank_sets.add(group_ranks)
             self.prefetch_sync_groups.append(
+                create_custom_parallel_group(
+                    group_ranks=list(group_ranks), backend="gloo"
+                )
+            )
+            self.prefetch_sync_groups2.append(
                 create_custom_parallel_group(
                     group_ranks=list(group_ranks), backend="gloo"
                 )
@@ -380,6 +393,10 @@ class HiCacheController:
 
     def _all_reduce_prefetch_groups(self, tensor: torch.Tensor, op) -> None:
         for group in self.prefetch_sync_groups:
+            torch.distributed.all_reduce(tensor, op=op, group=group)
+
+    def _all_reduce_prefetch_groups2(self, tensor: torch.Tensor, op) -> None:
+        for group in self.prefetch_sync_groups2:
             torch.distributed.all_reduce(tensor, op=op, group=group)
 
     def _start_storage_threads(self):
@@ -957,8 +974,8 @@ class HiCacheController:
                 completed_tokens_tensor = torch.tensor(
                     operation.completed_tokens, dtype=torch.int
                 )
-                self._all_reduce_prefetch_groups(
-                    completed_tokens_tensor, torch.distributed.ReduceOp.MIN
+                self._all_reduce_prefetch_groups2(
+                    completed_tokens_tensor, torch.distributed.ReduceOp.MIN,
                 )
                 operation.completed_tokens = completed_tokens_tensor.item()
                 self.ack_prefetch_queue.put(operation)
