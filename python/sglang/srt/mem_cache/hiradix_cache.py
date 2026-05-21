@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import atexit
-import queue
+import hashlib
 import heapq
+import io
 import json
 import logging
 import os
+import queue
+import sys
 import threading
 import time
 from queue import Empty, Queue
@@ -112,6 +115,8 @@ class HiRadixCache(RadixCache):
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
+        self.hicache_sanity_check_interval = server_args.hicache_sanity_check_interval
+        self._hicache_event_round = 0
 
         (
             extra_config,
@@ -1133,6 +1138,7 @@ class HiRadixCache(RadixCache):
         self.writing_check()
 
     def check_hicache_events(self):
+        self._hicache_event_round += 1
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
@@ -1142,7 +1148,94 @@ class HiRadixCache(RadixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        if self.hicache_sanity_check_interval > 0 and (
+            self._hicache_event_round % self.hicache_sanity_check_interval == 0
+        ):
+            self.sanity_check()
         self._reap_completed_async_work()
+
+    @staticmethod
+    def _tree_child_sort_key(child_key) -> tuple:
+        if isinstance(child_key, tuple):
+            return tuple(HiRadixCache._tree_child_sort_key(x) for x in child_key)
+        return (0, child_key)
+
+    def _sanity_check_radix_tree_digest(self, node: TreeNode, hasher: "hashlib._Hash") -> None:
+        """
+        Compute the hash of radix tree recursively, including node fields that are expected to
+        be identical across PP ranks.
+        """
+        if node is not self.root_node:
+            key = node.key
+            hasher.update((key.extra_key or "").encode("utf-8"))
+            hasher.update(b"\x01" if key.is_bigram else b"\x00")
+            for token_id in key.token_ids:
+                hasher.update(str(token_id).encode("utf-8"))
+            if node.value is not None:
+                hasher.update(node.value.detach().cpu().view(-1).numpy().tobytes())
+            if node.host_value is not None:
+                hasher.update(
+                    node.host_value.detach().cpu().view(-1).numpy().tobytes()
+                )
+            hasher.update(str(node.lock_ref).encode("utf-8"))
+
+        for child_key in sorted(
+            node.children.keys(), key=self._tree_child_sort_key
+        ):
+            self._sanity_check_radix_tree_digest(node.children[child_key], hasher)
+
+    def sanity_check(self) -> None:
+        """Verify identical radix-tree state across PP ranks."""
+        if self.pp_size <= 1 and self.tp_world_size <= 1:
+            return
+
+        hasher = hashlib.sha256()
+        self._sanity_check_radix_tree_digest(self.root_node, hasher)
+        hasher.update(str(self.protected_size_).encode("utf-8"))
+        hasher.update(str(self.evictable_size_).encode("utf-8"))
+        digest = hasher.digest()
+        local_hash = torch.tensor(list(digest), dtype=torch.uint8, device="cpu")
+
+        if self.pp_size > 1:
+            sync_tensor = (
+                local_hash.clone()
+                if self.pp_rank == 0
+                else torch.zeros_like(local_hash)
+            )
+            self._pp_sync(sync_tensor)
+            if self.pp_rank > 0 and not torch.equal(sync_tensor, local_hash):
+                rank = torch.distributed.get_rank()
+                buffer = io.StringIO()
+                self.pretty_print_to_file(buffer)
+                logger.critical(
+                    "Radix tree state diverged on rank %s local_hash %s pp_rank %s content: %s",
+                    rank,
+                    digest.hex(),
+                    self.pp_rank,
+                    buffer.getvalue(),
+                )
+                sys.exit(1)
+            logger.debug("Sanity check pass")
+            return
+
+        min_hash = local_hash.clone()
+        max_hash = local_hash.clone()
+        self._all_reduce_attn_groups(min_hash, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_attn_groups(max_hash, torch.distributed.ReduceOp.MAX)
+        if torch.equal(min_hash, max_hash):
+            logger.debug("Sanity check pass")
+            return
+
+        rank = torch.distributed.get_rank()
+        buffer = io.StringIO()
+        self.pretty_print_to_file(buffer)
+        logger.critical(
+            "Radix tree state diverged on rank %s local_hash %s content: %s",
+            rank,
+            digest.hex(),
+            buffer.getvalue(),
+        )
+        sys.exit(1)
 
     def _maybe_terminate_ready_prefetches(self):
         for req_id, info in list(self.ongoing_prefetch.items()):
