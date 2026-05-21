@@ -826,7 +826,7 @@ class HiRadixCache(RadixCache):
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._pp_sync(finish_count_tensor)
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
 
         if finish_count > 0:
@@ -852,7 +852,7 @@ class HiRadixCache(RadixCache):
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._pp_sync(finish_count_tensor)
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
 
         if finish_count > 0:
@@ -1262,8 +1262,7 @@ class HiRadixCache(RadixCache):
             dtype=torch.int,
         )
 
-        # self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
-        self._pp_sync(qsizes)
+        self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
 
         n_revoke, n_ack_prefetch, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
@@ -1639,6 +1638,18 @@ class HiRadixCache(RadixCache):
             self.work_list = self.work_list[count:]
         return
 
+    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
+        """
+        Synchronize data across all TP and PP ranks.
+
+        In particular, "tp_reduce_op" is performed on all TP ranks of the first PP rank,
+        and then the result is propagated to all following PP ranks.
+
+        Must be called in the scheduler thread.
+        """
+        self._all_reduce_attn_groups(data, tp_reduce_op)
+        self._pp_sync(data)
+
     def _pp_sync(self, data: torch.Tensor) -> None:
         """
         Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
@@ -1652,7 +1663,7 @@ class HiRadixCache(RadixCache):
         2     |                         | _pp_sync(data=1) ends   |
         3     |                         |                         | _pp_sync(data=1) ends
 
-        _pp_sync requires no synchronization pointer among ranks. The following case may also happen.
+        _pp_sync requires no synchronization point among ranks. The following case may also happen.
 
         time  | pp0                     | pp1                     | pp2
         ------|-------------------------|-------------------------|-----------------------------
@@ -1664,11 +1675,11 @@ class HiRadixCache(RadixCache):
         5     |                         |                         | _pp_sync(data=1) ends
         """
         if self.pp_rank > 0:
-            torch.distributed.recv(data, src=self.pp_rank-1, group=self.pp_group, tag=2)
+            torch.distributed.recv(data, group_src=self.pp_rank-1, group=self.pp_group, tag=2)
         if self.pp_rank + 1 < self.pp_size:
             # Make a copy of data, so that the caller is safe to modify `data` after this call.
             # This is cheap, as _pp_sync is not to be used for transmitting large data.
             copy_of_data = data.clone()
-            send_work = torch.distributed.isend(copy_of_data, dst=self.pp_rank+1, group=self.pp_group, tag=2)
+            send_work = torch.distributed.isend(copy_of_data, group_dst=self.pp_rank+1, group=self.pp_group, tag=2)
             self.work_list.append(send_work)
         return
