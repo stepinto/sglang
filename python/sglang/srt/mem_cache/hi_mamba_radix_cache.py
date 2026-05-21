@@ -445,6 +445,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.loading_check()
 
         if self.enable_storage:
+            self._maybe_terminate_ready_prefetches()
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
@@ -1445,6 +1446,7 @@ class HiMambaRadixCache(MambaRadixCache):
     def _drain_storage_control_queues_local(self):
         self._drain_storage_control_queues_impl(
             n_revoke=None,
+            n_ack_prefetch=None,
             n_backup=None,
             n_release=None,
             log_metrics=False,
@@ -1453,6 +1455,7 @@ class HiMambaRadixCache(MambaRadixCache):
     def _drain_storage_control_queues_impl(
         self,
         n_revoke: Optional[int],
+        n_ack_prefetch: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
         log_metrics: bool,
@@ -1480,6 +1483,10 @@ class HiMambaRadixCache(MambaRadixCache):
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
 
+        def _drain_ack_prefetch():
+            for operation in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
+                self._complete_prefetch_ack(operation, log_metrics=log_metrics)
+
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 ack_id = operation.id
@@ -1501,8 +1508,87 @@ class HiMambaRadixCache(MambaRadixCache):
                 cc.mem_pool_host.free(host_indices)
 
         _drain_revoke()
+        _drain_ack_prefetch()
         _drain_backup()
         _drain_release()
+
+    def _complete_prefetch_ack(
+        self, operation: PrefetchOperation, log_metrics: bool = True
+    ):
+        req_id = operation.request_id
+        info = self.ongoing_prefetch.pop(req_id, None)
+        if info is None:
+            return
+
+        last_host_node, token_ids, host_indices, _ = info
+        completed_tokens = operation.completed_tokens
+        hash_value = operation.hash_value
+
+        min_completed_tokens = completed_tokens
+        if self.tp_world_size > 1:
+            completed_tokens_tensor = torch.tensor(
+                min_completed_tokens, dtype=torch.int
+            )
+            torch.distributed.all_reduce(
+                completed_tokens_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            min_completed_tokens = completed_tokens_tensor.item()
+
+        mamba_host_indices = None
+        mamba_loaded = False
+        for transfer in operation.pool_transfers or []:
+            if transfer.name == PoolName.MAMBA:
+                mamba_host_indices = transfer.host_indices
+                mamba_loaded = (
+                    operation.pool_storage_result.extra_pool_hit_pages.get(
+                        PoolName.MAMBA, 0
+                    )
+                    >= 1
+                )
+                break
+
+        fetched_token_ids = token_ids[:min_completed_tokens]
+        written_indices = host_indices[:min_completed_tokens]
+        matched_length = self._insert_helper_host(
+            last_host_node,
+            RadixKey(
+                token_ids=fetched_token_ids,
+                extra_key=last_host_node.key.extra_key,
+            ),
+            written_indices,
+            hash_value[: min_completed_tokens // self.page_size],
+            mamba_host_indices,
+            mamba_loaded,
+        )
+
+        truncated_len = operation.host_indices.numel()
+        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        self.cache_controller.append_host_mem_release(
+            host_indices[min_completed_tokens:truncated_len]
+        )
+
+        if mamba_host_indices is not None:
+            inserted_new = matched_length < min_completed_tokens
+            if not inserted_new or not mamba_loaded:
+                self.mamba_pool_host.free(mamba_host_indices)
+
+        self._release_host_node(last_host_node)
+        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+        loaded_from_storage = min_completed_tokens - matched_length
+        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+
+        if log_metrics and self.enable_storage_metrics:
+            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+        if loaded_from_storage > 0 and operation.pool_transfers:
+            logger.debug(
+                "HiCache mamba prefetch completed for request %s: prefetched_tokens=%s mamba_states=%s",
+                req_id,
+                loaded_from_storage,
+                int(mamba_loaded),
+            )
 
     def _parse_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
@@ -1605,12 +1691,21 @@ class HiMambaRadixCache(MambaRadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
+    def _maybe_terminate_ready_prefetches(self):
+        for req_id, info in list(self.ongoing_prefetch.items()):
+            _, _, _, operation = info
+            if operation.host_indices is None:
+                continue
+            if self.can_terminate_prefetch(operation):
+                self.cache_controller.terminate_prefetch(operation)
+
     def drain_storage_control_queues(self):
         cc = self.cache_controller
 
         qsizes = torch.tensor(
             [
                 cc.prefetch_revoke_queue.qsize(),
+                cc.ack_prefetch_queue.qsize(),
                 cc.ack_backup_queue.qsize(),
                 cc.host_mem_release_queue.qsize(),
             ],
@@ -1621,9 +1716,10 @@ class HiMambaRadixCache(MambaRadixCache):
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 
-        n_revoke, n_backup, n_release = map(int, qsizes.tolist())
+        n_revoke, n_ack_prefetch, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
+            n_ack_prefetch=n_ack_prefetch,
             n_backup=n_backup,
             n_release=n_release,
             log_metrics=True,
@@ -1761,92 +1857,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
 
     def check_prefetch_progress(self, req_id: str) -> bool:
-        if req_id not in self.ongoing_prefetch:
-            return True
-
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
-            req_id
-        ]
-
-        if operation.host_indices is None:
-            return True
-
-        if not self.can_terminate_prefetch(operation):
-            return False
-
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
-
-        min_completed_tokens = completed_tokens
-        if self.tp_world_size > 1:
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
-            )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = completed_tokens_tensor.item()
-
-        mamba_host_indices = None
-        mamba_loaded = False
-        for transfer in operation.pool_transfers or []:
-            if transfer.name == PoolName.MAMBA:
-                mamba_host_indices = transfer.host_indices
-                mamba_loaded = (
-                    operation.pool_storage_result.extra_pool_hit_pages.get(
-                        PoolName.MAMBA, 0
-                    )
-                    >= 1
-                )
-                break
-
-        fetched_token_ids = token_ids[:min_completed_tokens]
-        written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
-            last_host_node,
-            RadixKey(
-                token_ids=fetched_token_ids,
-                extra_key=last_host_node.key.extra_key,
-            ),
-            written_indices,
-            hash_value[: min_completed_tokens // self.page_size],
-            mamba_host_indices,
-            mamba_loaded,
-        )
-
-        # Free host KV memory: matched portion is already in tree, tail was unused
-        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
-
-        # Free mamba host slot if it wasn't inserted into the tree
-        if mamba_host_indices is not None:
-            inserted_new = matched_length < min_completed_tokens
-            if not inserted_new or not mamba_loaded:
-                self.mamba_pool_host.free(mamba_host_indices)
-
-        self._release_host_node(last_host_node)
-        del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
-
-        loaded_from_storage = min_completed_tokens - matched_length
-        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
-
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
-        if loaded_from_storage > 0 and operation.pool_transfers:
-            logger.debug(
-                "HiCache mamba prefetch completed for request %s: prefetched_tokens=%s mamba_states=%s",
-                req_id,
-                loaded_from_storage,
-                int(mamba_loaded),
-            )
-
-        return True
+        return req_id not in self.ongoing_prefetch
 
     def _insert_helper_host(
         self,

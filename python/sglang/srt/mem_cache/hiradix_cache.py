@@ -475,6 +475,7 @@ class HiRadixCache(RadixCache):
         """
         self._drain_storage_control_queues_impl(
             n_revoke=None,
+            n_ack_prefetch=None,
             n_backup=None,
             n_release=None,
             log_metrics=False,
@@ -483,6 +484,7 @@ class HiRadixCache(RadixCache):
     def _drain_storage_control_queues_impl(
         self,
         n_revoke: Optional[int],
+        n_ack_prefetch: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
         log_metrics: bool,
@@ -509,6 +511,10 @@ class HiRadixCache(RadixCache):
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
 
+        def _drain_ack_prefetch():
+            for operation in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
+                self._complete_prefetch_ack(operation, log_metrics=log_metrics)
+
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 ack_id = operation.id
@@ -529,8 +535,45 @@ class HiRadixCache(RadixCache):
                 cc.mem_pool_host.free(host_indices)
 
         _drain_revoke()
+        _drain_ack_prefetch()
         _drain_backup()
         _drain_release()
+
+    def _complete_prefetch_ack(
+        self, operation: PrefetchOperation, log_metrics: bool = True
+    ):
+        req_id = operation.request_id
+        info = self.ongoing_prefetch.pop(req_id, None)
+        if info is None:
+            return
+
+        last_host_node, prefetch_key, host_indices, _ = info
+        completed_tokens = operation.completed_tokens
+        hash_value = operation.hash_value
+        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+
+        fetched_key = prefetch_key[:completed_tokens]
+        written_indices = host_indices[:completed_tokens]
+        matched_length = self._insert_helper_host(
+            last_host_node,
+            fetched_key,
+            written_indices,
+            hash_value[: completed_tokens // self.page_size],
+        )
+
+        truncated_len = operation.host_indices.numel()
+        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        self.cache_controller.append_host_mem_release(
+            host_indices[completed_tokens:truncated_len]
+        )
+        last_host_node.release_host()
+        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+
+        loaded_from_storage = completed_tokens - matched_length
+        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+
+        if log_metrics and self.enable_storage_metrics:
+            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
     def _parse_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
@@ -1079,11 +1122,20 @@ class HiRadixCache(RadixCache):
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
+            self._maybe_terminate_ready_prefetches()
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+
+    def _maybe_terminate_ready_prefetches(self):
+        for req_id, info in list(self.ongoing_prefetch.items()):
+            _, _, _, operation = info
+            if operation.host_indices is None:
+                continue
+            if self.can_terminate_prefetch(operation):
+                self.cache_controller.terminate_prefetch(operation)
 
     def drain_storage_control_queues(self):
         """
@@ -1095,6 +1147,7 @@ class HiRadixCache(RadixCache):
         qsizes = torch.tensor(
             [
                 cc.prefetch_revoke_queue.qsize(),
+                cc.ack_prefetch_queue.qsize(),
                 cc.ack_backup_queue.qsize(),
                 cc.host_mem_release_queue.qsize(),
             ],
@@ -1102,9 +1155,10 @@ class HiRadixCache(RadixCache):
         )
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
-        n_revoke, n_backup, n_release = map(int, qsizes.tolist())
+        n_revoke, n_ack_prefetch, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
+            n_ack_prefetch=n_ack_prefetch,
             n_backup=n_backup,
             n_release=n_release,
             log_metrics=True,
@@ -1152,60 +1206,7 @@ class HiRadixCache(RadixCache):
         return can_terminate
 
     def check_prefetch_progress(self, req_id: str) -> bool:
-        if req_id not in self.ongoing_prefetch:
-            # there is no ongoing prefetch for this request or it has been revoked
-            return True
-
-        # todo: more policies for prefetch progress such as timeout
-        # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, prefetch_key, host_indices, operation = self.ongoing_prefetch[
-            req_id
-        ]
-
-        if operation.host_indices is None:
-            # prefetch has not been issued due to insufficient host memory
-            return True
-
-        if not self.can_terminate_prefetch(operation):
-            return False
-
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
-
-        min_completed_tokens = completed_tokens
-        # Synchronize workers before mutating host cache tree state.
-        completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
-        self._all_reduce_attn_groups(
-            completed_tokens_tensor, torch.distributed.ReduceOp.MIN
-        )
-        min_completed_tokens = completed_tokens_tensor.item()
-        fetched_key = prefetch_key[:min_completed_tokens]
-        written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
-            last_host_node,
-            fetched_key,
-            written_indices,
-            hash_value[: min_completed_tokens // self.page_size],
-        )
-
-        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
-        last_host_node.release_host()
-        del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
-
-        # Track tokens actually loaded from storage for this request (L3 hits)
-        loaded_from_storage = min_completed_tokens - matched_length
-        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
-
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
-
-        return True
+        return req_id not in self.ongoing_prefetch
 
     def terminate_prefetch(self, req_id: str):
         if req_id not in self.ongoing_prefetch:

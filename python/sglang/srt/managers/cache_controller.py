@@ -400,6 +400,7 @@ class HiCacheController:
         self.backup_queue = Queue()
 
         self.prefetch_revoke_queue = Queue()
+        self.ack_prefetch_queue = Queue()
         self.ack_backup_queue = Queue()
         self.host_mem_release_queue = Queue()
 
@@ -665,6 +666,7 @@ class HiCacheController:
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_revoke_queue.queue.clear()
+            self.ack_prefetch_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
 
         self.stop_event.clear()
@@ -952,10 +954,14 @@ class HiCacheController:
                 if operation is None:
                     continue
                 self._page_transfer(operation)
-                # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
+                completed_tokens_tensor = torch.tensor(
+                    operation.completed_tokens, dtype=torch.int
                 )
+                self._all_reduce_prefetch_groups(
+                    completed_tokens_tensor, torch.distributed.ReduceOp.MIN
+                )
+                operation.completed_tokens = completed_tokens_tensor.item()
+                self.ack_prefetch_queue.put(operation)
             except Empty:
                 continue
 
