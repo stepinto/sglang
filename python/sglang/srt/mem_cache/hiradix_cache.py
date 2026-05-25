@@ -492,15 +492,17 @@ class HiRadixCache(RadixCache):
     ):
         cc = self.cache_controller
 
-        def _drain_queue(q: queue.Queue, limit: Optional[int]):
-            drained = 0
-            while limit is None or drained < limit:
-                try:
+        def _drain_queue(q: queue.Queue, n: Optional[int]):
+            if n is None:
+                while not q.empty():
                     item = q.get()
-                except Empty:
-                    break
-                drained += 1
-                yield item
+                    yield item
+            else:
+                for _ in range(n):
+                    # Block when there is no enough elements.
+                    # All TP/PP ranks must consume the same number of elements.
+                    item = q.get()
+                    yield item
 
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
