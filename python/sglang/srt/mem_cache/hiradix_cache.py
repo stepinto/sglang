@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, TextIO
 
 import torch
 
@@ -1154,6 +1154,18 @@ class HiRadixCache(RadixCache):
         ):
             self._sanity_check_radix_tree_digest(node.children[child_key], hasher)
 
+    def pretty_print_to_file(self, f: TextIO) -> None:
+        super().pretty_print_to_file(f)
+        print(f"#ongoing_prefetch: {len(self.ongoing_prefetch)}", file=f)
+        print(f"#ongoing_backup: {len(self.ongoing_backup)}", file=f)
+        print(f"#ongoing_write_through: {len(self.ongoing_write_through)}", file=f)
+        print(f"#ongoing_load_back: {len(self.ongoing_load_back)}", file=f)
+        print(
+            f"#prefetch_tokens_occupied: "
+            f"{getattr(self.cache_controller, 'prefetch_tokens_occupied', 0)}",
+            file=f,
+        )
+
     def sanity_check(self) -> None:
         """Verify identical radix-tree state across PP ranks."""
         if self.pp_size <= 1 and self.tp_world_size <= 1:
@@ -1163,49 +1175,47 @@ class HiRadixCache(RadixCache):
         self._sanity_check_radix_tree_digest(self.root_node, hasher)
         hasher.update(str(self.protected_size_).encode("utf-8"))
         hasher.update(str(self.evictable_size_).encode("utf-8"))
+        hasher.update(str(len(self.ongoing_prefetch)).encode("utf-8"))
+        hasher.update(str(len(self.ongoing_backup)).encode("utf-8"))
+        if self.enable_storage:
+            hasher.update(
+                str(self.cache_controller.prefetch_tokens_occupied).encode("utf-8")
+            )
+        hasher.update(str(len(self.ongoing_write_through)).encode("utf-8"))
+        hasher.update(str(len(self.ongoing_load_back)).encode("utf-8"))
         digest = hasher.digest()
         local_hash = torch.tensor(list(digest), dtype=torch.uint8, device="cpu")
 
+        min_hash = local_hash.clone()
+        max_hash = local_hash.clone()
+        diverged = False
+        if self.pp_rank == 0:
+            self._all_reduce_attn_groups(min_hash, torch.distributed.ReduceOp.MIN)
+            self._all_reduce_attn_groups(max_hash, torch.distributed.ReduceOp.MAX)
+            diverged = not torch.equal(min_hash, max_hash)
+
         if self.pp_size > 1:
             sync_tensor = (
-                local_hash.clone()
+                min_hash.clone()
                 if self.pp_rank == 0
                 else torch.zeros_like(local_hash)
             )
             self._pp_sync(sync_tensor)
-            if self.pp_rank > 0 and not torch.equal(sync_tensor, local_hash):
-                rank = torch.distributed.get_rank()
-                buffer = io.StringIO()
-                self.pretty_print_to_file(buffer)
-                logger.critical(
-                    "Radix tree state diverged on rank %s local_hash %s pp_rank %s content: %s",
-                    rank,
-                    digest.hex(),
-                    self.pp_rank,
-                    buffer.getvalue(),
-                )
-                sys.exit(1)
-            logger.debug("Sanity check pass")
-            return
+            if self.pp_rank > 0:
+                diverged = diverged or not torch.equal(sync_tensor, local_hash)
 
-        min_hash = local_hash.clone()
-        max_hash = local_hash.clone()
-        self._all_reduce_attn_groups(min_hash, torch.distributed.ReduceOp.MIN)
-        self._all_reduce_attn_groups(max_hash, torch.distributed.ReduceOp.MAX)
-        if torch.equal(min_hash, max_hash):
-            logger.debug("Sanity check pass")
-            return
+        if diverged:
+            buffer = io.StringIO()
+            self.pretty_print_to_file(buffer)
+            logger.critical(
+                "Radix tree state diverged local_hash %s content: %s",
+                digest.hex(),
+                self.pp_rank,
+                buffer.getvalue(),
+            )
+            sys.exit(1)
 
-        rank = torch.distributed.get_rank()
-        buffer = io.StringIO()
-        self.pretty_print_to_file(buffer)
-        logger.critical(
-            "Radix tree state diverged on rank %s local_hash %s content: %s",
-            rank,
-            digest.hex(),
-            buffer.getvalue(),
-        )
-        sys.exit(1)
+        logger.debug("Sanity check pass")
 
     def _maybe_terminate_ready_prefetches(self):
         for req_id, info in list(self.ongoing_prefetch.items()):
