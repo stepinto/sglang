@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from queue import Empty
+import queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -1463,15 +1463,17 @@ class HiMambaRadixCache(MambaRadixCache):
     ):
         cc = self.cache_controller
 
-        def _drain_queue(q, limit: Optional[int]):
-            drained = 0
-            while limit is None or drained < limit:
-                try:
-                    item = q.get_nowait()
-                except Empty:
-                    break
-                drained += 1
-                yield item
+        def _drain_queue(q: queue.Queue, n: Optional[int]):
+            if n is None:
+                while not q.empty():
+                    item = q.get()
+                    yield item
+            else:
+                for _ in range(n):
+                    # Block when there is no enough elements.
+                    # All TP/PP ranks must consume the same number of elements.
+                    item = q.get()
+                    yield item
 
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
