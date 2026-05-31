@@ -1637,7 +1637,8 @@ class HiRadixCache(RadixCache):
 
         Must be called in the scheduler thread.
         """
-        self._all_reduce_attn_groups(data, tp_reduce_op)
+        if self.pp_rank == 0:
+            self._all_reduce_attn_groups(data, tp_reduce_op)
         self._pp_sync(data)
 
     def _pp_sync(self, data: torch.Tensor) -> None:

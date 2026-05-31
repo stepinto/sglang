@@ -1969,7 +1969,8 @@ class HiMambaRadixCache(MambaRadixCache):
             self.work_list.append(send_work)
 
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
-        self._all_reduce_attn_groups(data, tp_reduce_op)
+        if self.cache_controller.pp_rank == 0:
+            self._all_reduce_attn_groups(data, tp_reduce_op)
         self._pp_sync(data)
 
     def _flush_pending_storage_backups_before_reset(self) -> None:
