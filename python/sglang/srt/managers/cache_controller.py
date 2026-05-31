@@ -268,7 +268,7 @@ class HiCacheController:
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.pp_group = pp_group
-        self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.prefetch_sync_groups1: List[torch.distributed.ProcessGroup] = []
         self.prefetch_sync_groups2: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -351,11 +351,10 @@ class HiCacheController:
             )
         return 0, 1
 
-    def _create_prefetch_sync_groups(self) -> None:
+    def _create_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
-        self.prefetch_sync_groups = []
-        self.prefetch_sync_groups2 = []
+        groups: List[torch.distributed.ProcessGroup] = []
         seen_rank_sets = set()
 
         if self.attn_cp_group is not None or self.attn_tp_group is not None:
@@ -374,33 +373,34 @@ class HiCacheController:
             if group_ranks in seen_rank_sets:
                 continue
             seen_rank_sets.add(group_ranks)
-            self.prefetch_sync_groups.append(
+            groups.append(
                 create_custom_parallel_group(
                     group_ranks=list(group_ranks), backend="gloo"
                 )
             )
-            self.prefetch_sync_groups2.append(
-                create_custom_parallel_group(
-                    group_ranks=list(group_ranks), backend="gloo"
-                )
-            )
+        return groups
 
-    def _destroy_prefetch_sync_groups(self) -> None:
-        for group in self.prefetch_sync_groups + self.prefetch_sync_groups2:
+    def _destroy_sync_groups(
+        self, groups: List[torch.distributed.ProcessGroup]
+    ) -> None:
+        for group in groups:
             try:
                 torch.distributed.destroy_process_group(group)
             except Exception:
                 pass
-        self.prefetch_sync_groups = []
-        self.prefetch_sync_groups2 = []
 
-    def _all_reduce_prefetch_groups(self, tensor: torch.Tensor, op) -> None:
-        for group in self.prefetch_sync_groups:
+    def _all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op,
+        groups: List[torch.distributed.ProcessGroup],
+    ) -> None:
+        for group in groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
 
-    def _all_reduce_prefetch_groups2(self, tensor: torch.Tensor, op) -> None:
-        for group in self.prefetch_sync_groups2:
-            torch.distributed.all_reduce(tensor, op=op, group=group)
+    def _barrier(self, groups: List[torch.distributed.ProcessGroup]) -> None:
+        for group in groups:
+            torch.distributed.barrier(group=group)
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -549,7 +549,8 @@ class HiCacheController:
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
-            self._create_prefetch_sync_groups()
+            self.prefetch_sync_groups1 = self._create_sync_groups()
+            self.prefetch_sync_groups2 = self._create_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -574,7 +575,10 @@ class HiCacheController:
                 self._stop_storage_threads()
             except Exception:
                 pass
-            self._destroy_prefetch_sync_groups()
+            self._destroy_sync_groups(self.prefetch_sync_groups1)
+            self._destroy_sync_groups(self.prefetch_sync_groups2)
+            self.prefetch_sync_groups1 = []
+            self.prefetch_sync_groups2 = []
             try:
                 if (
                     hasattr(self, "storage_backend")
@@ -612,7 +616,11 @@ class HiCacheController:
             raise RuntimeError("Stop storage threads failed; detach aborted.") from e
 
         # Best-effort destroy process groups created for storage ops.
-        self._destroy_prefetch_sync_groups()
+        self._destroy_sync_groups(
+            self.prefetch_sync_groups1 + self.prefetch_sync_groups2
+        )
+        self.prefetch_sync_groups1 = []
+        self.prefetch_sync_groups2 = []
 
         # Best-effort close (some backends rely on GC/destructor).
         try:
@@ -1073,8 +1081,10 @@ class HiCacheController:
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
-                self._all_reduce_prefetch_groups(
-                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+                self._all_reduce(
+                    storage_hit_count_tensor,
+                    torch.distributed.ReduceOp.MIN,
+                    self.prefetch_sync_groups1,
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
@@ -1224,7 +1234,11 @@ class HiCacheController:
                 # Determine the minimal successful prefix of tokens.
                 if self.tp_size > 1 or self.pp_size > 1:
                     completed_tokens_tensor = torch.tensor(ack.completed_tokens, dtype=torch.int)
-                    self._all_reduce_prefetch_groups2(completed_tokens_tensor, torch.distributed.ReduceOp.MIN)
+                    self._all_reduce(
+                        completed_tokens_tensor,
+                        torch.distributed.ReduceOp.MIN,
+                        self.prefetch_sync_groups2,
+                    )
                     ack.completed_tokens = completed_tokens_tensor.item()
                 self.ack_prefetch_queue.put(ack)
             except Empty:
