@@ -397,19 +397,15 @@ class HiMambaRadixCache(MambaRadixCache):
             return
 
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        if self.cache_controller.pp_rank == 0:
+            for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
 
-        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                queue_size,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-        finish_count = int(queue_size.item())
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = int(finish_count_tensor.item())
 
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
@@ -424,16 +420,23 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def loading_check(self):
         finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-            if not finish_event.query():
-                # the KV cache loading is still ongoing
-                break
-            finish_count += 1
+        if self.cache_controller.pp_rank == 0:
+            for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
+
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = int(finish_count_tensor.item())
+
+        while finish_count > 0:
+            _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+            finish_event.synchronize()
             for ack_id in ack_list:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
-
-        del self.cache_controller.ack_load_queue[:finish_count]
+            finish_count -= 1
 
     def ready_to_load_host_cache(self) -> int:
         return self.cache_controller.start_loading()
@@ -1721,10 +1724,7 @@ class HiMambaRadixCache(MambaRadixCache):
             ],
             dtype=torch.int,
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
+        self._all_reduce(qsizes, torch.distributed.ReduceOp.MIN)
 
         n_revoke, n_ack_prefetch, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
