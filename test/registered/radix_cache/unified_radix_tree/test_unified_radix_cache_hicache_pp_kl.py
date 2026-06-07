@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -70,9 +71,9 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--tp-size",
-                "2",
+                os.environ.get("TP_SIZE", "2"),
                 "--pp-size",
-                "2",
+                os.environ.get("PP_SIZE", "2"),
                 "--mem-fraction-static",
                 "0.8",
                 "--cuda-graph-max-bs",
