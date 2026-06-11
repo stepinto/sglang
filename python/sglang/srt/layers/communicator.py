@@ -32,6 +32,8 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -65,9 +67,15 @@ from sglang.srt.layers.moe import (
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.layers.quantization.fp8_utils import _use_aiter_bpreshuffle_gfx95
 from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
     mla_use_prefill_cp,
+)
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -273,7 +281,7 @@ class AttnTpContext:
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
-            and get_global_server_args().disable_piecewise_cuda_graph
+            and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             and get_global_server_args().speculative_algorithm != "EAGLE3"
         )
         if get_global_server_args().enable_attn_tp_input_scattered:
@@ -372,6 +380,15 @@ class LayerScatterModes:
     def _compute_layer_input_mode(cls, context: _LayerModeComputationContext):
         if context.layer_id == 0:
             return ScatterMode.model_input_output()
+
+        pp_group = get_pp_group()
+        if not pp_group.is_first_rank:
+            start_layer, _ = get_pp_indices(
+                context.num_layers, pp_group.rank_in_group, pp_group.world_size
+            )
+            if context.layer_id == start_layer:
+                return ScatterMode.model_input_output()
+
         return cls._compute_layer_output_mode(context.previous_layer())
 
     @classmethod
@@ -430,6 +447,33 @@ class LayerScatterModes:
 
 def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
+
+
+def gather_hidden_states_and_residual_for_pp(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    layer_scatter_modes: LayerScatterModes,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if layer_scatter_modes.layer_output_mode == ScatterMode.SCATTERED:
+        attn_tp_size = get_attention_tp_size()
+        if attn_tp_size > 1:
+            output = torch.empty(
+                (hidden_states.shape[0] * attn_tp_size, *hidden_states.shape[1:]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            attn_tp_all_gather_into_tensor(output, hidden_states)
+            hidden_states = output
+            if residual is not None:
+                output = torch.empty(
+                    (residual.shape[0] * attn_tp_size, *residual.shape[1:]),
+                    dtype=residual.dtype,
+                    device=residual.device,
+                )
+                attn_tp_all_gather_into_tensor(output, residual)
+                residual = output
+
+    return hidden_states, residual
 
 
 class LayerCommunicator:
@@ -572,6 +616,7 @@ class LayerCommunicator:
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
                             output_unquantized_inp1=_dsa_needs_bf16,
+                            transpose_scale=_use_aiter_bpreshuffle_gfx95,
                         )
                         if _dsa_needs_bf16:
                             hidden_states = (
@@ -617,6 +662,7 @@ class LayerCommunicator:
                                 dtype_quant=torch.float8_e4m3fn,
                                 res1=residual,
                                 output_unquantized_inp1=_dsa_needs_bf16,
+                                transpose_scale=_use_aiter_bpreshuffle_gfx95,
                             )
                         )
                         if _dsa_needs_bf16:
