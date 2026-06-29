@@ -717,6 +717,63 @@ class TestHiSparseUnit(unittest.TestCase):
         self._assert_sizes_restored(initial, "single_node_staging_pages")
 
     # ==================================================================
+    # Test: host backup with a hot-buffer gap (start_pos > allocated_len)
+    # ==================================================================
+    def test_alloc_paged_token_slots_allows_hot_buffer_gap(self):
+        """Short-prefill request decoding past the hot buffer leaves a host gap.
+
+        Regression: a request whose prefill_len < device_buffer_size never
+        host-backs the decode tokens that stay inside the device hot buffer, so
+        req_to_host_pool_allocated_len stays at round_up(prefill_len). When the
+        sequence first decodes past device_buffer_size, the host backup starts at
+        start_pos == device_buffer_size, which is > allocated_len. This must not
+        raise (previously tripped `assert start_pos <= allocated_len`).
+        """
+        initial = self._get_initial_sizes()
+        mem_pool_host = self.coordinator.mem_pool_host
+        req_to_host_pool = self.coordinator.req_to_host_pool
+        allocated_len_tbl = self.coordinator.req_to_host_pool_allocated_len
+        req_pool_idx = 0
+
+        # Simulate a short prefill: host-backed positions [0, prefill_len).
+        prefill_len = self.page_size  # < DEVICE_BUFFER_SIZE
+        prefill_slots = mem_pool_host.alloc_paged_token_slots(
+            req_to_host_pool, allocated_len_tbl, req_pool_idx, 0, prefill_len
+        )
+        rounded_prefill = (
+            (prefill_len + self.page_size - 1) // self.page_size * self.page_size
+        )
+        self.assertEqual(int(allocated_len_tbl[req_pool_idx]), rounded_prefill)
+        self.assertLess(rounded_prefill, DEVICE_BUFFER_SIZE)
+        self.assertTrue(torch.all(prefill_slots >= 0))
+
+        # First decode token past the hot buffer: start_pos > allocated_len.
+        start_pos = DEVICE_BUFFER_SIZE
+        cold_slots = mem_pool_host.alloc_paged_token_slots(
+            req_to_host_pool, allocated_len_tbl, req_pool_idx, start_pos, 1
+        )
+        self.assertEqual(cold_slots.numel(), 1)
+        self.assertTrue(torch.all(cold_slots >= 0))
+        # allocated_len now covers the cold position (page-aligned).
+        expected_allocated = (
+            (start_pos + 1 + self.page_size - 1) // self.page_size * self.page_size
+        )
+        self.assertEqual(int(allocated_len_tbl[req_pool_idx]), expected_allocated)
+        # The returned slot maps to the requested token position.
+        self.assertEqual(
+            int(req_to_host_pool[req_pool_idx, start_pos]), int(cold_slots[0])
+        )
+
+        # Free the host slots we allocated to restore pool sizes.
+        host_indices = mem_pool_host.allocated_host_indices(
+            req_to_host_pool, req_pool_idx, int(allocated_len_tbl[req_pool_idx])
+        )
+        mem_pool_host.free(host_indices)
+        req_to_host_pool[req_pool_idx].fill_(-1)
+        allocated_len_tbl[req_pool_idx] = 0
+        self._assert_sizes_restored(initial, "hot_buffer_gap")
+
+    # ==================================================================
     # Test: Direct-to-host (PD separated) path
     # ==================================================================
     def test_request_lifecycle_direct_path(self):

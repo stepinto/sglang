@@ -126,7 +126,14 @@ class HiSparseHostPoolMixin:
         allocated_len = int(req_to_host_pool_allocated_len[req_pool_idx])
         end_pos = start_pos + num_tokens
         page_end = self._round_up_to_page_size(end_pos)
-        assert start_pos <= allocated_len
+        # start_pos may exceed allocated_len: in spec-decode host backup, decode
+        # tokens whose positions stay within the device hot buffer are never
+        # host-backed, so a short-prefill request that later decodes past the hot
+        # buffer leaves a gap [allocated_len, start_pos) of intentionally-skipped
+        # host positions. The allocation below still extends from allocated_len to
+        # page_end, so start_pos is covered; the gap slots get host indices but no
+        # KV (harmless, since hot-buffer tokens are served from device, never host).
+        assert start_pos >= 0
 
         if page_end > allocated_len:
             num_new_pages = (page_end - allocated_len) // self.page_size
