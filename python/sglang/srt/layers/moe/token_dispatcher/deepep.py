@@ -77,6 +77,33 @@ def _deepep_precompile_tp_barrier() -> None:
         get_tp_group().barrier()
 
 
+# --- DeepEP low-latency collective tracing (debug-only) ---------------------
+# Enable with SGLANG_DEEPEP_TRACE=1. Each rank appends a line per low_latency
+# dispatch/combine to /tmp/deepep_trace_rank{global_rank}.log with a monotonic
+# per-rank sequence counter and tensor shapes (shape is metadata, so this does
+# NOT trigger a host sync and will not change the hang timing). Diff the files
+# across ranks (`diff <(...) <(...)`) — the first line that differs is the exact
+# collective where ranks diverge.
+import os as _os
+
+_DEEPEP_TRACE_ENABLED = _os.environ.get("SGLANG_DEEPEP_TRACE") == "1"
+_deepep_trace_file = None
+_deepep_trace_seq = 0
+
+
+def _deepep_trace(op: str, **shapes) -> None:
+    if not _DEEPEP_TRACE_ENABLED:
+        return
+    global _deepep_trace_file, _deepep_trace_seq
+    if _deepep_trace_file is None:
+        rank = dist.get_rank() if dist.is_initialized() else -1
+        _deepep_trace_file = open(f"/tmp/deepep_trace_rank{rank}.log", "w")
+    _deepep_trace_seq += 1
+    parts = " ".join(f"{k}={tuple(v)}" for k, v in shapes.items())
+    _deepep_trace_file.write(f"SEQ={_deepep_trace_seq} OP={op} {parts}\n")
+    _deepep_trace_file.flush()
+
+
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
     def __call__(self, dispatcher: BaseDispatcher):
         for hook_fun in self.hook_dict.values():
@@ -719,6 +746,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        _deepep_trace(
+            "ll_dispatch",
+            hidden=hidden_states.shape,
+            topk=topk_ids.shape,
+        )
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -799,6 +831,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         with ctx:
             _deepep_precompile_tp_barrier()
+            _deepep_trace(
+                "ll_combine",
+                hidden=hidden_states.shape,
+                topk=topk_ids.shape,
+            )
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
                 topk_idx=topk_ids,
