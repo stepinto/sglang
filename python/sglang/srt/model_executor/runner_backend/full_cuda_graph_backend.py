@@ -83,12 +83,24 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
+        #
+        # A barrier *before* each forward is not enough when forward_fn issues
+        # multiple back-to-back collectives (e.g. EAGLE/MTP draft_forward runs
+        # speculative_num_steps-1 draft forwards, each doing an EP-wide DeepEP
+        # low_latency dispatch/combine). Without a sync+barrier *after* each
+        # collective region, ranks drift across the warmup/capture/next-shape
+        # boundaries and a DeepEP all-to-all on one rank pairs with the wrong
+        # boundary on a lagging rank, leaving the device-side collective stuck
+        # forever (one rank hangs in cudaSynchronize, others wait at the next
+        # barrier). Close every collective region with a device sync + barrier.
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
+            self._device_module.synchronize()
+            self._tp_group.barrier()
 
         graph = torch.cuda.CUDAGraph()
 
@@ -106,6 +118,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
             out = forward_fn()
+
+        # Close the capture region too: keep all ranks in lockstep before
+        # moving on to the next shape so the next shape's collectives pair up.
+        self._device_module.synchronize()
+        self._tp_group.barrier()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
