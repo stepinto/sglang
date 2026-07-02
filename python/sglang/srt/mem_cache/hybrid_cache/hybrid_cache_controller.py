@@ -635,14 +635,14 @@ class HybridCacheController(BaseHiCacheController):
 
     def _page_transfer(self, operation) -> bool:
         # KV pools first — determines actual completed page count
-        ok = super()._page_transfer(operation)
+        kv_success = super()._page_transfer(operation)
 
         # Extra pools only after KV fully completes. If KV terminated early
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         if operation.pool_transfers:
             pool_hits: dict[str, int] = {}
-            if ok:
+            if kv_success:
                 self._sync_trailing_keys(operation.pool_transfers, operation.hash_value)
                 self._resolve_sidecar_derived_pool_transfers(operation)
                 results = self.storage_backend.batch_get_v2(operation.pool_transfers)
@@ -655,7 +655,7 @@ class HybridCacheController(BaseHiCacheController):
                     pool_hits=pool_hits,
                 )
             )
-        return ok
+        return kv_success
 
     def _page_backup(self, operation):
         # Backup extra pools

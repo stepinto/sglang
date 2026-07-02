@@ -209,7 +209,8 @@ class PrefetchOperation(StorageOperation):
             self._terminated_flag = True
 
     def is_terminated(self) -> bool:
-        return self._terminated_flag
+        with self._lock:
+            return self._terminated_flag
 
 
 class HiCacheController:
