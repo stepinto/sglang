@@ -31,6 +31,7 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.layers.utils.dcp_utils import dcp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
 )
@@ -264,7 +265,9 @@ class EagerRunner(BaseRunner):
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         if forward_batch.needs_forward_metadata_init():
-            if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
+            if dcp_enabled() and hasattr(
+                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
                     model_runner.model.prepare_context_parallel_metadata_for_dcp(
