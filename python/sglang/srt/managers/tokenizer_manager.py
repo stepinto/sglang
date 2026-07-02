@@ -3161,3 +3161,9 @@ def stamp_http_worker_ipc(obj: Any, ipc_name: str) -> None:
         obj.http_worker_ipc = ipc_name
     elif isinstance(obj, BaseBatchReq):
         obj.http_worker_ipcs = [ipc_name] * len(obj.rids)
+        # The scheduler unpacks the batch and reads each sub-request's own
+        # http_worker_ipc, so stamp them too or the output can't be routed back.
+        batch = getattr(obj, "batch", None)
+        if batch is not None:
+            for req in batch:
+                req.http_worker_ipc = ipc_name
