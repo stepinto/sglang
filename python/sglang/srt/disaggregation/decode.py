@@ -47,15 +47,15 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
+    PPConsensus,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
-    build_pp_consensus_polls,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_pp_consensus_polls,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
-    normalize_pp_consensus_rids,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
     prepare_abort,
@@ -737,7 +737,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
 
-        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+        self._apply_handshake_polls(polls, rids_to_check)
+
+    def _apply_handshake_polls(
+        self,
+        polls: List[Optional[KVPoll]],
+        rids_to_check: Optional[List[str]] = None,
+    ) -> None:
+        for decode_req, poll in zip(self.queue, polls):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -766,7 +773,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-            else:
+            elif poll is not None:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
     def _ensure_prefill_info(
@@ -860,55 +867,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
-        pp_good_rids: Optional[List[str]] = None,
-        pp_bad_rids: Optional[List[str]] = None,
+        pp_consensus: Optional[PPConsensus] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop requests, optionally applying an authoritative PP consensus."""
-        pp_consensus = normalize_pp_consensus_rids(pp_good_rids, pp_bad_rids)
-        is_pp_mode = pp_consensus is not None
-        if is_pp_mode and rids_to_check is not None:
+        if pp_consensus is not None and rids_to_check is not None:
             raise ValueError(
                 "rids_to_check cannot be combined with a PP consensus result"
             )
 
-        good_rids, bad_rids = pp_consensus or (frozenset(), frozenset())
-
         self._resolve_pending_reqs()
-        if not is_pp_mode:
+        if pp_consensus is None:
             self._update_handshake_waiters(rids_to_check)
-        else:
-            # The PP ring has already polled every stage. Do not poll again:
-            # an abort arriving between consensus and application must not make
-            # stages apply different outcomes.
-            for decode_req in self.queue:
-                rid = decode_req.req.rid
-                if rid in good_rids and not decode_req.waiting_for_input:
-                    decode_req.waiting_for_input = True
-                    decode_req.req.time_stats.set_bootstrap_done_time()
-                elif rid in bad_rids:
-                    error_message = (
-                        "Decode handshake failed by PP consensus for request "
-                        f"rank={self.tp_rank} {decode_req.req.rid=} "
-                        f"{decode_req.req.bootstrap_room=}"
-                    )
-                    is_propagated = False
-                    try:
-                        decode_req.kv_receiver.failure_exception()
-                    except Exception as e:
-                        error_message += f" with exception {e}"
-                        is_propagated = getattr(e, "is_from_another_rank", False)
-                    if is_propagated:
-                        logger.debug(error_message)
-                    else:
-                        logger.error(error_message)
-                    if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                        prepare_abort(
-                            decode_req.req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                    if self.scheduler.metrics_reporter.enable_metrics:
-                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
 
         failed_reqs = []
         preallocated_reqs = []
@@ -949,11 +918,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
+        pp_polls = get_pp_consensus_polls(
+            (decode_req.req.rid for decode_req in self.queue),
+            KVPoll.WaitingForInput,
+            pp_consensus,
+        )
+        if pp_polls is not None:
+            # The PP result is authoritative; do not re-poll local state here.
+            self._apply_handshake_polls(pp_polls)
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             rid = decode_req.req.rid
-            if is_pp_mode:
-                if rid not in bad_rids:
+            if pp_polls is not None:
+                if pp_polls[i] != KVPoll.Failed:
                     continue
             elif rids_to_check is not None and rid not in rids_to_check:
                 continue
@@ -994,8 +972,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             rid = decode_req.req.rid
-            if is_pp_mode:
-                if rid not in good_rids:
+            if pp_polls is not None:
+                if pp_polls[i] != KVPoll.WaitingForInput:
                     continue
             elif rids_to_check is not None and rid not in rids_to_check:
                 continue
@@ -1946,8 +1924,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def pop_transferred(
         self,
         rids_to_check: Optional[List[str]] = None,
-        pp_good_rids: Optional[List[str]] = None,
-        pp_bad_rids: Optional[List[str]] = None,
+        pp_consensus: Optional[PPConsensus] = None,
     ) -> List[Req]:
         """Pop finished transfers, optionally applying a PP consensus result.
 
@@ -1955,14 +1932,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         can make stages apply different outcomes when a failure or abort arrives
         between consensus and queue processing.
         """
-        pp_polls = build_pp_consensus_polls(
+        pp_polls = get_pp_consensus_polls(
             (decode_req.req.rid for decode_req in self.queue),
             KVPoll.Success,
-            pp_good_rids,
-            pp_bad_rids,
+            pp_consensus,
         )
-        is_pp_mode = pp_polls is not None
-        if is_pp_mode and rids_to_check is not None:
+        if pp_consensus is not None and rids_to_check is not None:
             raise ValueError(
                 "rids_to_check cannot be combined with a PP consensus result"
             )
@@ -1970,7 +1945,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if not self.queue:
             return []
 
-        if self.scheduler.enable_decode_hicache and not is_pp_mode:
+        if self.scheduler.enable_decode_hicache and pp_consensus is None:
             self._process_hicache_local_restores(
                 [
                     decode_req

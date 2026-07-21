@@ -228,7 +228,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         # must force the request down the failure cleanup path on every stage.
         mock_poll.return_value = [KVPoll.Success]
 
-        transferred = queue.pop_transferred(pp_good_rids=[], pp_bad_rids=[req.rid])
+        transferred = queue.pop_transferred(pp_consensus=[[], [req.rid]])
 
         self.assertEqual(transferred, [])
         self.assertEqual(queue.queue, [])
@@ -272,7 +272,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.scheduler = scheduler
         mock_poll.return_value = [KVPoll.Failed]
 
-        transferred = queue.pop_transferred(pp_good_rids=[req.rid], pp_bad_rids=[])
+        transferred = queue.pop_transferred(pp_consensus=[[req.rid], []])
 
         self.assertEqual(transferred, [req])
         self.assertEqual(queue.queue, [])
@@ -297,9 +297,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         self.assertIs(forwarded, release_payload)
         self.assertEqual(scheduler.waiting_queue, [released_req])
-        queue.pop_transferred.assert_called_once_with(
-            pp_good_rids=["good"], pp_bad_rids=["bad"]
-        )
+        queue.pop_transferred.assert_called_once_with(pp_consensus=release_payload)
 
     def test_decode_transfer_consensus_intersects_success_and_unions_failure(self):
         queue = MagicMock()
@@ -307,20 +305,17 @@ class TestDecodeQueueCleanup(CustomTestCase):
             ["good-on-both", "good-only-current"],
             ["bad-current"],
         )
-        scheduler = SimpleNamespace(
-            pp_group=SimpleNamespace(is_first_rank=False),
-            disagg_decode_transfer_queue=queue,
-            _pp_recv_pyobj_from_prev_stage=MagicMock(
-                return_value=[
-                    ["good-on-both", "good-only-previous"],
-                    ["bad-previous"],
-                ]
-            ),
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_group = SimpleNamespace(is_first_rank=False)
+        scheduler.disagg_decode_transfer_queue = queue
+        scheduler._pp_recv_pyobj_from_prev_stage = MagicMock(
+            return_value=[
+                ["good-on-both", "good-only-previous"],
+                ["bad-previous"],
+            ]
         )
 
-        good_rids, bad_rids = SchedulerPPMixin._pp_pd_get_decode_transferred_ids(
-            scheduler
-        )
+        good_rids, bad_rids = scheduler._pp_pd_get_decode_transferred_ids()
 
         self.assertEqual(set(good_rids), {"good-on-both"})
         self.assertEqual(set(bad_rids), {"bad-current", "bad-previous"})
@@ -363,7 +358,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             target, "finished_reason", FINISH_ABORT("PP consensus failure")
         )
 
-        good, failed = queue.pop_preallocated(pp_good_rids=[], pp_bad_rids=[req.rid])
+        good, failed = queue.pop_preallocated(pp_consensus=[[], [req.rid]])
 
         self.assertEqual(good, [])
         self.assertEqual(failed, [decode_req])
@@ -392,9 +387,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         forwarded = SchedulerPPMixin.process_prealloc_queue(scheduler, payload)
 
         self.assertEqual(forwarded, payload)
-        queue.pop_preallocated.assert_called_once_with(
-            pp_good_rids=["good"], pp_bad_rids=["bad"]
-        )
+        queue.pop_preallocated.assert_called_once_with(pp_consensus=payload)
         transfer_queue.extend.assert_called_once_with([good_req])
 
         queue.pop_preallocated.return_value = ([], [failed_req])

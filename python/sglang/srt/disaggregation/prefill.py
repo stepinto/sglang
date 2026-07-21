@@ -37,11 +37,12 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
+    PPConsensus,
     ReqToMetadataIdxAllocator,
     TransferBackend,
-    build_pp_consensus_polls,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_pp_consensus_polls,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
@@ -334,15 +335,13 @@ class PrefillBootstrapQueue:
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
-        pp_good_rids: Optional[List[str]] = None,
-        pp_bad_rids: Optional[List[str]] = None,
+        pp_consensus: Optional[PPConsensus] = None,
     ) -> List[Req] | tuple[List[Req], List[Req]]:
         """
         pop the reqs which has finished bootstrapping
 
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
-        pp_good_rids: For PP, the rids that PP consensus determined as good (WaitingForInput)
-        pp_bad_rids: For PP, the rids that PP consensus determined as bad (Failed)
+        pp_consensus: Authoritative PP result as [successful_rids, failed_rids].
         """
 
         bootstrapped_reqs = []
@@ -355,11 +354,10 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        polls = build_pp_consensus_polls(
+        polls = get_pp_consensus_polls(
             (req.rid for req in self.queue),
             KVPoll.WaitingForInput,
-            pp_good_rids,
-            pp_bad_rids,
+            pp_consensus,
         )
         if polls is None:
             polls = poll_and_all_reduce_attn_cp_tp_group(

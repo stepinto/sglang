@@ -15,11 +15,9 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import (
-    PPConsensusPayload,
-    make_pp_consensus_payload,
-    merge_pp_consensus_payload,
+    PPConsensus,
+    merge_pp_consensus,
     poll_and_all_reduce_attn_cp_tp_group,
-    split_pp_consensus_payload,
 )
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
@@ -805,52 +803,36 @@ class SchedulerPPMixin:
 
         return predicted_size
 
-    def process_bootstrapped_queue(
-        self: Scheduler, bootstrapped_rids: Optional[PPConsensusPayload]
-    ):
+    def process_bootstrapped_queue(self: Scheduler, consensus: Optional[PPConsensus]):
         # finished consensus bootstrapped reqs and prepare the waiting queue
-        if bootstrapped_rids is not None:
-            (
-                good_consensus_bootstrapped_rids,
-                bad_consensus_bootstrapped_rids,
-            ) = split_pp_consensus_payload(bootstrapped_rids)
-            good_reqs, _ = self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
-                return_failed_reqs=True,
-                pp_good_rids=good_consensus_bootstrapped_rids,
-                pp_bad_rids=bad_consensus_bootstrapped_rids,
-            )
-            self.waiting_queue.extend(good_reqs)
-            # Success can still be deferred by local metadata capacity. Keep
-            # failures authoritative while forwarding only admitted successes.
-            return make_pp_consensus_payload(
-                [req.rid for req in good_reqs],
-                bad_consensus_bootstrapped_rids,
-            )
-        return None
+        if consensus is None:
+            return None
+        good_reqs, _ = self.disagg_prefill_bootstrap_queue.pop_bootstrapped(
+            return_failed_reqs=True, pp_consensus=consensus
+        )
+        self.waiting_queue.extend(good_reqs)
+        return [[req.rid for req in good_reqs], consensus[1]]
+
+    def _pp_merge_local_consensus(
+        self: Scheduler, successful_rids: List[str], failed_rids: List[str]
+    ) -> PPConsensus:
+        previous = (
+            None
+            if self.pp_group.is_first_rank
+            else self._pp_recv_pyobj_from_prev_stage()
+        )
+        return merge_pp_consensus(previous, successful_rids, failed_rids)
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
-        if self.pp_group.is_first_rank:
-            # First rank, pop the bootstrap reqs from the bootstrap queue
-            local_good_rids, local_bad_rids = self.get_rids(
+        return self._pp_merge_local_consensus(
+            *self.get_rids(
                 self.disagg_prefill_bootstrap_queue.queue,
                 True,
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
-            return make_pp_consensus_payload(local_good_rids, local_bad_rids)
-        else:
-            # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
-            prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
-            local_good_rids, local_bad_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
-            )
-            return merge_pp_consensus_payload(
-                prev_bootstrapped_rids, local_good_rids, local_bad_rids
-            )
+        )
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
@@ -1348,44 +1330,21 @@ class SchedulerPPMixin:
 
     def _pp_pd_get_prealloc_ids(self: Scheduler):
         # communicate pre-consensus prealloc reqs
-        if self.pp_group.is_first_rank:
-            # First rank, pop the preallocated reqs from the prealloc queue
-            local_good_rids, local_bad_rids = self.get_rids(
+        return self._pp_merge_local_consensus(
+            *self.get_rids(
                 self.disagg_decode_prealloc_queue.queue,
                 False,
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
-            return make_pp_consensus_payload(local_good_rids, local_bad_rids)
-        else:
-            # Other ranks, receive the preallocated reqs info from the previous rank and ensure the consensus
-            prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
-            local_good_rids, local_bad_rids = self.get_rids(
-                self.disagg_decode_prealloc_queue.queue,
-                False,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
-            )
-            return merge_pp_consensus_payload(
-                prev_prealloc_rids, local_good_rids, local_bad_rids
-            )
+        )
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
         # Successful transfers require every PP stage to observe success. A
         # failure observed by any stage must be applied by every stage.
-        if self.pp_group.is_first_rank:
-            local_good_rids, local_bad_rids = (
-                self.disagg_decode_transfer_queue.get_finished_rids()
-            )
-            return make_pp_consensus_payload(local_good_rids, local_bad_rids)
-        else:
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            local_good_rids, local_bad_rids = (
-                self.disagg_decode_transfer_queue.get_finished_rids()
-            )
-            return merge_pp_consensus_payload(
-                prev_transferred_rids, local_good_rids, local_bad_rids
-            )
+        return self._pp_merge_local_consensus(
+            *self.disagg_decode_transfer_queue.get_finished_rids()
+        )
 
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
@@ -1397,48 +1356,32 @@ class SchedulerPPMixin:
             return [req.rid for req in resumed_reqs]
         return None
 
-    def process_prealloc_queue(
-        self: Scheduler, prealloc_rids: Optional[PPConsensusPayload]
-    ):
+    def process_prealloc_queue(self: Scheduler, consensus: Optional[PPConsensus]):
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return [[], []]
 
-        if prealloc_rids is not None:
-            (
-                good_consensus_prealloc_rids,
-                bad_consensus_prealloc_rids,
-            ) = split_pp_consensus_payload(prealloc_rids)
-            good_reqs, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
-                pp_good_rids=good_consensus_prealloc_rids,
-                pp_bad_rids=bad_consensus_prealloc_rids,
-            )
-            self.disagg_decode_transfer_queue.extend(good_reqs)
-            # Success can still be deferred by local KV capacity. Keep failures
-            # authoritative while forwarding only preallocated successes.
-            return make_pp_consensus_payload(
-                [req.req.rid for req in good_reqs],
-                bad_consensus_prealloc_rids,
-            )
-        return None
+        if consensus is None:
+            return None
+        good_reqs, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+            pp_consensus=consensus
+        )
+        self.disagg_decode_transfer_queue.extend(good_reqs)
+        return [[req.req.rid for req in good_reqs], consensus[1]]
 
     def process_decode_transfer_queue(
-        self: Scheduler, release_rids: Optional[PPConsensusPayload]
+        self: Scheduler, consensus: Optional[PPConsensus]
     ):
-        if release_rids is not None:
-            good_release_rids, bad_release_rids = split_pp_consensus_payload(
-                release_rids
-            )
-            released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
-                pp_good_rids=good_release_rids,
-                pp_bad_rids=bad_release_rids,
-            )
-            if self.enable_hisparse:
-                for req in released_reqs:
-                    self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(released_reqs)
-            return release_rids
-        return None
+        if consensus is None:
+            return None
+        released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
+            pp_consensus=consensus
+        )
+        if self.enable_hisparse:
+            for req in released_reqs:
+                self.hisparse_coordinator.admit_request_direct(req)
+        self.waiting_queue.extend(released_reqs)
+        return consensus
 
 
 class ChunkSizePredictor:

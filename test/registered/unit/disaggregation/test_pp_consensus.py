@@ -5,11 +5,8 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.utils import (
-    build_pp_consensus_polls,
-    make_pp_consensus_payload,
-    merge_pp_consensus_payload,
-    normalize_pp_consensus_rids,
-    split_pp_consensus_payload,
+    get_pp_consensus_polls,
+    merge_pp_consensus,
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -19,11 +16,10 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestPPConsensusUtils(unittest.TestCase):
     def test_build_polls_is_authoritative_and_failure_wins(self):
-        polls = build_pp_consensus_polls(
+        polls = get_pp_consensus_polls(
             ["good", "bad", "overlap", "pending"],
             KVPoll.Success,
-            ["good", "overlap"],
-            ["bad", "overlap"],
+            [["good", "overlap"], ["bad", "overlap"]],
         )
 
         self.assertEqual(
@@ -31,31 +27,25 @@ class TestPPConsensusUtils(unittest.TestCase):
             [KVPoll.Success, KVPoll.Failed, KVPoll.Failed, None],
         )
 
-    def test_consensus_arguments_must_be_provided_together(self):
-        with self.assertRaisesRegex(ValueError, "must be provided together"):
-            normalize_pp_consensus_rids(["good"], None)
-
     def test_merge_intersects_success_and_unions_failure(self):
-        payload = merge_pp_consensus_payload(
+        payload = merge_pp_consensus(
             [["shared", "previous-only", "fails-later"], ["previous-failure"]],
             ["shared", "current-only"],
             ["current-failure", "fails-later"],
         )
 
+        self.assertEqual(set(payload[0]), {"shared"})
         self.assertEqual(
-            payload,
-            [["shared"], ["previous-failure", "current-failure", "fails-later"]],
+            set(payload[1]),
+            {"previous-failure", "current-failure", "fails-later"},
         )
 
-    def test_payload_helpers_deduplicate_and_validate(self):
-        payload = make_pp_consensus_payload(
-            ["good", "good", "overlap"], ["bad", "overlap", "bad"]
+    def test_first_stage_deduplicates_and_failure_wins(self):
+        payload = merge_pp_consensus(
+            None, ["good", "good", "overlap"], ["bad", "overlap", "bad"]
         )
-        self.assertEqual(payload, [["good"], ["bad", "overlap"]])
-        self.assertEqual(split_pp_consensus_payload(payload), (payload[0], payload[1]))
-
-        with self.assertRaisesRegex(ValueError, "must be"):
-            split_pp_consensus_payload(["flat", "payload"])
+        self.assertEqual(set(payload[0]), {"good"})
+        self.assertEqual(set(payload[1]), {"bad", "overlap"})
 
 
 class TestPrefillPPConsensus(unittest.TestCase):
@@ -68,8 +58,7 @@ class TestPrefillPPConsensus(unittest.TestCase):
 
         good, failed = queue.pop_bootstrapped(
             return_failed_reqs=True,
-            pp_good_rids=[],
-            pp_bad_rids=[req.rid],
+            pp_consensus=[[], [req.rid]],
         )
 
         self.assertEqual(good, [])
@@ -95,8 +84,7 @@ class TestPrefillPPConsensus(unittest.TestCase):
 
         good, failed = queue.pop_bootstrapped(
             return_failed_reqs=True,
-            pp_good_rids=[req.rid],
-            pp_bad_rids=[],
+            pp_consensus=[[req.rid], []],
         )
 
         self.assertEqual(good, [req])
@@ -121,8 +109,7 @@ class TestPrefillPPConsensus(unittest.TestCase):
         self.assertEqual(scheduler.waiting_queue, [req])
         queue.pop_bootstrapped.assert_called_once_with(
             return_failed_reqs=True,
-            pp_good_rids=["good"],
-            pp_bad_rids=["bad"],
+            pp_consensus=payload,
         )
 
         queue.pop_bootstrapped.return_value = ([], [SimpleNamespace(rid="bad")])
