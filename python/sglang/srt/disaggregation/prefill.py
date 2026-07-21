@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_pp_consensus_polls,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_aborted,
@@ -354,24 +355,13 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        # In PP mode with consensus results, skip local polling and use PP consensus
-        # This prevents divergence when abort notifications arrive between consensus
-        # and pop_bootstrapped execution on different PP ranks.
-        is_pp_mode = pp_good_rids is not None and pp_bad_rids is not None
-
-        if is_pp_mode:
-            # Fake polls based on PP consensus - no need to poll local state
-            # which may have changed due to abort notifications arriving at different times
-            polls = []
-            for req in self.queue:
-                if req.rid in pp_good_rids:
-                    polls.append(KVPoll.WaitingForInput)
-                elif req.rid in pp_bad_rids:
-                    polls.append(KVPoll.Failed)
-                else:
-                    # Request not in consensus - skip it
-                    polls.append(None)
-        else:
+        polls = build_pp_consensus_polls(
+            (req.rid for req in self.queue),
+            KVPoll.WaitingForInput,
+            pp_good_rids,
+            pp_bad_rids,
+        )
+        if polls is None:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],
                 self.scheduler.attn_cp_cpu_group,
@@ -380,7 +370,6 @@ class PrefillBootstrapQueue:
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if poll is None:
-                # In PP mode, skip requests not in consensus
                 continue
 
             if poll == KVPoll.Failed:

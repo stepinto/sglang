@@ -391,11 +391,15 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         forwarded = SchedulerPPMixin.process_prealloc_queue(scheduler, payload)
 
-        self.assertIs(forwarded, payload)
+        self.assertEqual(forwarded, payload)
         queue.pop_preallocated.assert_called_once_with(
             pp_good_rids=["good"], pp_bad_rids=["bad"]
         )
         transfer_queue.extend.assert_called_once_with([good_req])
+
+        queue.pop_preallocated.return_value = ([], [failed_req])
+        forwarded = SchedulerPPMixin.process_prealloc_queue(scheduler, payload)
+        self.assertEqual(forwarded, [[], ["bad"]])
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)

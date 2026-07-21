@@ -5,7 +5,17 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    overload,
+)
 
 import numpy as np
 import torch
@@ -82,6 +92,86 @@ class DisaggregationMode(Enum):
 #########################
 # Synchronization
 #########################
+
+PPConsensusPayload = List[List[str]]
+
+
+def normalize_pp_consensus_rids(
+    pp_good_rids: Optional[Sequence[str]],
+    pp_bad_rids: Optional[Sequence[str]],
+) -> Optional[Tuple[frozenset[str], frozenset[str]]]:
+    """Validate and normalize an authoritative PP consensus decision."""
+    if (pp_good_rids is None) != (pp_bad_rids is None):
+        raise ValueError("pp_good_rids and pp_bad_rids must be provided together")
+    if pp_good_rids is None:
+        return None
+
+    bad_rids = frozenset(pp_bad_rids)
+    # Failure wins defensively if a malformed payload contains an overlap.
+    good_rids = frozenset(pp_good_rids).difference(bad_rids)
+    return good_rids, bad_rids
+
+
+def build_pp_consensus_polls(
+    rids: Iterable[str],
+    success_poll: KVPoll,
+    pp_good_rids: Optional[Sequence[str]],
+    pp_bad_rids: Optional[Sequence[str]],
+) -> Optional[List[Optional[KVPoll]]]:
+    """Map a PP consensus decision to per-request authoritative poll states."""
+    normalized = normalize_pp_consensus_rids(pp_good_rids, pp_bad_rids)
+    if normalized is None:
+        return None
+
+    good_rids, bad_rids = normalized
+    return [
+        KVPoll.Failed if rid in bad_rids else success_poll if rid in good_rids else None
+        for rid in rids
+    ]
+
+
+def make_pp_consensus_payload(
+    good_rids: Sequence[str], bad_rids: Sequence[str]
+) -> PPConsensusPayload:
+    """Build a deterministic ``[good, bad]`` payload with failure precedence."""
+    bad = list(dict.fromkeys(bad_rids))
+    bad_set = set(bad)
+    good = [rid for rid in dict.fromkeys(good_rids) if rid not in bad_set]
+    return [good, bad]
+
+
+def split_pp_consensus_payload(
+    payload: Sequence[Sequence[str]],
+) -> Tuple[List[str], List[str]]:
+    """Validate and unpack the wire representation of a PP consensus result."""
+    if (
+        not isinstance(payload, (list, tuple))
+        or len(payload) != 2
+        or not all(isinstance(rids, (list, tuple)) for rids in payload)
+    ):
+        raise ValueError("PP consensus payload must be [good_rids, bad_rids]")
+    return list(payload[0]), list(payload[1])
+
+
+def merge_pp_consensus_payload(
+    previous: Sequence[Sequence[str]],
+    local_good_rids: Sequence[str],
+    local_bad_rids: Sequence[str],
+) -> PPConsensusPayload:
+    """Intersect successes and union failures while preserving stable ordering."""
+    previous_good, previous_bad = split_pp_consensus_payload(previous)
+    local = make_pp_consensus_payload(local_good_rids, local_bad_rids)
+    local_good, local_bad = split_pp_consensus_payload(local)
+
+    bad = list(dict.fromkeys([*previous_bad, *local_bad]))
+    bad_set = set(bad)
+    local_good_set = set(local_good)
+    good = [
+        rid
+        for rid in dict.fromkeys(previous_good)
+        if rid in local_good_set and rid not in bad_set
+    ]
+    return [good, bad]
 
 
 def _get_failure_prob() -> float:

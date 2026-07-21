@@ -50,10 +50,12 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    build_pp_consensus_polls,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    normalize_pp_consensus_rids,
     poll_and_all_reduce,
     poll_and_all_reduce_with_staging,
     prepare_abort,
@@ -862,18 +864,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         pp_bad_rids: Optional[List[str]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop requests, optionally applying an authoritative PP consensus."""
-        if (pp_good_rids is None) != (pp_bad_rids is None):
-            raise ValueError("pp_good_rids and pp_bad_rids must be provided together")
-        is_pp_mode = pp_good_rids is not None
+        pp_consensus = normalize_pp_consensus_rids(pp_good_rids, pp_bad_rids)
+        is_pp_mode = pp_consensus is not None
         if is_pp_mode and rids_to_check is not None:
             raise ValueError(
                 "rids_to_check cannot be combined with a PP consensus result"
             )
 
-        good_rids = set(pp_good_rids or [])
-        bad_rids = set(pp_bad_rids or [])
-        # Failure wins defensively if a malformed payload overlaps.
-        good_rids.difference_update(bad_rids)
+        good_rids, bad_rids = pp_consensus or (frozenset(), frozenset())
 
         self._resolve_pending_reqs()
         if not is_pp_mode:
@@ -1957,9 +1955,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         can make stages apply different outcomes when a failure or abort arrives
         between consensus and queue processing.
         """
-        if (pp_good_rids is None) != (pp_bad_rids is None):
-            raise ValueError("pp_good_rids and pp_bad_rids must be provided together")
-        is_pp_mode = pp_good_rids is not None
+        pp_polls = build_pp_consensus_polls(
+            (decode_req.req.rid for decode_req in self.queue),
+            KVPoll.Success,
+            pp_good_rids,
+            pp_bad_rids,
+        )
+        is_pp_mode = pp_polls is not None
         if is_pp_mode and rids_to_check is not None:
             raise ValueError(
                 "rids_to_check cannot be combined with a PP consensus result"
@@ -1977,19 +1979,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ]
             )
 
-        if is_pp_mode:
-            good_rids = set(pp_good_rids or [])
-            bad_rids = set(pp_bad_rids or [])
-            polls = []
-            for decode_req in self.queue:
-                rid = decode_req.req.rid
-                if rid in bad_rids:
-                    # Failure wins defensively if a malformed payload overlaps.
-                    polls.append(KVPoll.Failed)
-                elif rid in good_rids:
-                    polls.append(KVPoll.Success)
-                else:
-                    polls.append(None)
+        if pp_polls is not None:
+            polls = pp_polls
         elif self.enable_staging:
             polls = self._poll_with_staging()
         else:
