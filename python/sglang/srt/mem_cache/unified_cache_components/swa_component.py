@@ -166,6 +166,7 @@ class SWAComponent(TreeComponent):
                 # consumption.
                 swa_host_hit += len(cd.host_value)
                 n_swa += len(cd.host_value)
+                self._swa_kv_pool_host.assert_slot_allocated(cd.host_value)
             else:
                 break
             node = node.parent
