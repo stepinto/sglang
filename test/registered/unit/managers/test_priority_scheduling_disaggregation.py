@@ -138,6 +138,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.tree_cache = MagicMock()
 
         scheduler = MagicMock()
+        scheduler.ps.pp_size = 1
         scheduler.enable_priority_scheduling = True
         scheduler.schedule_low_priority_values_first = low_priority_values_first
         scheduler.running_batch.reqs = []

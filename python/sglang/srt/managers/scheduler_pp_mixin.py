@@ -814,14 +814,14 @@ class SchedulerPPMixin:
         return [[req.rid for req in good_reqs], consensus[1]]
 
     def _pp_merge_local_consensus(
-        self: Scheduler, successful_rids: List[str], failed_rids: List[str]
+        self: Scheduler, ready_rids: List[str], failed_rids: List[str]
     ) -> PPConsensus:
         previous = (
             None
             if self.pp_group.is_first_rank
             else self._pp_recv_pyobj_from_prev_stage()
         )
-        return merge_pp_consensus(previous, successful_rids, failed_rids)
+        return merge_pp_consensus(previous, ready_rids, failed_rids)
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs

@@ -98,29 +98,29 @@ PPConsensus = List[List[str]]
 
 def get_pp_consensus_polls(
     rids: Iterable[str],
-    success_poll: KVPoll,
+    ready_poll: KVPoll,
     consensus: Optional[PPConsensus],
 ) -> Optional[List[Optional[KVPoll]]]:
     """Map a PP consensus decision to per-request authoritative poll states."""
     if consensus is None:
         return None
 
-    successful_rids, failed_rids = consensus
-    poll_by_rid = {rid: success_poll for rid in successful_rids}
+    ready_rids, failed_rids = consensus
+    poll_by_rid = {rid: ready_poll for rid in ready_rids}
     poll_by_rid.update({rid: KVPoll.Failed for rid in failed_rids})
     return [poll_by_rid.get(rid) for rid in rids]
 
 
 def merge_pp_consensus(
     previous: Optional[PPConsensus],
-    local_successful_rids: Sequence[str],
+    local_ready_rids: Sequence[str],
     local_failed_rids: Sequence[str],
 ) -> PPConsensus:
-    """Intersect successes and union failures across PP stages."""
-    previous_successful, previous_failed = previous or (local_successful_rids, [])
+    """Intersect ready requests and union failures across PP stages."""
+    previous_ready, previous_failed = previous or (local_ready_rids, [])
     failed = set(previous_failed) | set(local_failed_rids)
-    successful = (set(previous_successful) & set(local_successful_rids)) - failed
-    return [list(successful), list(failed)]
+    ready = (set(previous_ready) & set(local_ready_rids)) - failed
+    return [list(ready), list(failed)]
 
 
 def _get_failure_prob() -> float:

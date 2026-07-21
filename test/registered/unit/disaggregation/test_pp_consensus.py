@@ -54,6 +54,7 @@ class TestPrefillPPConsensus(unittest.TestCase):
         req = SimpleNamespace(rid="failed", disagg_kv_sender=MagicMock())
         queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
         queue.queue = [req]
+        queue.pp_size = 2
         queue.scheduler = SimpleNamespace(handle_bootstrap_failure=MagicMock())
 
         good, failed = queue.pop_bootstrapped(
@@ -79,6 +80,7 @@ class TestPrefillPPConsensus(unittest.TestCase):
         )
         queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
         queue.queue = [req]
+        queue.pp_size = 2
         queue.scheduler = SimpleNamespace(handle_bootstrap_failure=MagicMock())
         queue.finalize_bootstrap = MagicMock(return_value=True)
 
@@ -92,6 +94,37 @@ class TestPrefillPPConsensus(unittest.TestCase):
         self.assertEqual(queue.queue, [])
         mock_poll.assert_not_called()
         queue.finalize_bootstrap.assert_called_once_with(req)
+
+    @patch("sglang.srt.disaggregation.prefill.should_force_retry", return_value=False)
+    @patch("sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group")
+    def test_non_pp_ignores_consensus_override(
+        self, mock_poll, _mock_should_force_retry
+    ):
+        req = SimpleNamespace(
+            rid="local-ready",
+            disagg_kv_sender=MagicMock(),
+            time_stats=MagicMock(),
+        )
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.queue = [req]
+        queue.pp_size = 1
+        queue.scheduler = SimpleNamespace(
+            handle_bootstrap_failure=MagicMock(),
+            attn_cp_cpu_group=MagicMock(),
+            attn_tp_cpu_group=MagicMock(),
+        )
+        queue.finalize_bootstrap = MagicMock(return_value=True)
+        mock_poll.return_value = [KVPoll.WaitingForInput]
+
+        good, failed = queue.pop_bootstrapped(
+            return_failed_reqs=True,
+            pp_consensus=[[], [req.rid]],
+        )
+
+        self.assertEqual(good, [req])
+        self.assertEqual(failed, [])
+        mock_poll.assert_called_once()
+        queue.scheduler.handle_bootstrap_failure.assert_not_called()
 
     def test_scheduler_preserves_failure_and_filters_deferred_success(self):
         req = SimpleNamespace(rid="good")

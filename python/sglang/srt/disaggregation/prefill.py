@@ -341,7 +341,7 @@ class PrefillBootstrapQueue:
         pop the reqs which has finished bootstrapping
 
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
-        pp_consensus: Authoritative PP result as [successful_rids, failed_rids].
+        pp_consensus: Authoritative PP result as [ready_rids, failed_rids].
         """
 
         bootstrapped_reqs = []
@@ -354,11 +354,13 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        polls = get_pp_consensus_polls(
-            (req.rid for req in self.queue),
-            KVPoll.WaitingForInput,
-            pp_consensus,
-        )
+        polls = None
+        if self.pp_size > 1 and pp_consensus is not None:
+            polls = get_pp_consensus_polls(
+                (req.rid for req in self.queue),
+                KVPoll.WaitingForInput,
+                pp_consensus,
+            )
         if polls is None:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],

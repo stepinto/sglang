@@ -55,6 +55,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
+        scheduler.ps.pp_size = 1
         queue.scheduler = scheduler
 
         preallocated, failed = queue.pop_preallocated()
@@ -101,6 +102,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
+        scheduler.ps.pp_size = 1
         queue.scheduler = scheduler
 
         # Must not raise on the receiver __eq__ above.
@@ -168,6 +170,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
         scheduler.metrics_reporter.enable_metrics = False
+        scheduler.ps.pp_size = 1
         queue.scheduler = scheduler
 
         mock_poll.return_value = [KVPoll.Failed]
@@ -222,6 +225,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
         scheduler.metrics_reporter.enable_metrics = False
+        scheduler.ps.pp_size = 2
         queue.scheduler = scheduler
 
         # A second local poll would report success, but the PP failure consensus
@@ -269,6 +273,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler = MagicMock()
         scheduler.enable_decode_hicache = False
         scheduler.metrics_reporter.enable_metrics = False
+        scheduler.ps.pp_size = 2
         queue.scheduler = scheduler
         mock_poll.return_value = [KVPoll.Failed]
 
@@ -330,6 +335,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             bootstrap_room=9,
             return_logprob=False,
             finished_reason=None,
+            time_stats=MagicMock(),
         )
         decode_req = SimpleNamespace(
             req=req,
@@ -353,6 +359,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
         scheduler.metrics_reporter.enable_metrics = False
+        scheduler.ps.pp_size = 2
         queue.scheduler = scheduler
         mock_prepare_abort.side_effect = lambda target, *_args, **_kwargs: setattr(
             target, "finished_reason", FINISH_ABORT("PP consensus failure")
@@ -370,6 +377,46 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.output_streamer.stream_output.assert_called_once_with(
             [req], req.return_logprob
         )
+
+    @patch("sglang.srt.disaggregation.decode.prepare_abort")
+    def test_non_pp_prealloc_ignores_consensus_override(self, mock_prepare_abort):
+        req = SimpleNamespace(
+            rid="non-pp-local-waiting",
+            finished_reason=None,
+            origin_input_ids=[],
+            output_ids=[],
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            kv_receiver=FakeReceiver(),
+            waiting_for_input=False,
+        )
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+        queue.pending_reqs = []
+        queue.tp_rank = 0
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=0)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+
+        scheduler = MagicMock()
+        scheduler.ps.pp_size = 1
+        scheduler.running_batch.reqs = []
+        scheduler.enable_priority_scheduling = False
+        scheduler.enable_hisparse = False
+        scheduler.output_streamer = MagicMock()
+        queue.scheduler = scheduler
+
+        good, failed = queue.pop_preallocated(pp_consensus=[[], [req.rid]])
+
+        self.assertEqual(good, [])
+        self.assertEqual(failed, [])
+        self.assertEqual(queue.queue, [decode_req])
+        queue._update_handshake_waiters.assert_called_once_with(None)
+        mock_prepare_abort.assert_not_called()
 
     def test_process_prealloc_queue_preserves_consensus_classes(self):
         queue = MagicMock()
