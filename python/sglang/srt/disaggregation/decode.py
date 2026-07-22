@@ -47,11 +47,13 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
+    PPConsensus,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_pp_consensus_polls,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -86,7 +88,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import get_num_new_pages
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -735,7 +737,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
 
-        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+        for decode_req, poll in zip(self.queue, polls):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -745,27 +747,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
-                error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
-                is_propagated = False
-                try:
-                    decode_req.kv_receiver.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                    is_propagated = getattr(e, "is_from_another_rank", False)
-                # Mute error message for propagated exceptions to avoid duplicate logging
-                if is_propagated:
-                    logger.debug(error_message)
-                else:
-                    logger.error(error_message)
-                prepare_abort(
-                    decode_req.req,
-                    error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-                if self.scheduler.metrics_reporter.enable_metrics:
-                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                self._abort_handshake(decode_req)
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
+
+    def _abort_handshake(
+        self, decode_req: DecodeRequest, *, failed_by_pp: bool = False
+    ) -> None:
+        source = " by PP consensus" if failed_by_pp else ""
+        error_message = (
+            f"Decode handshake failed{source} for request rank={self.tp_rank} "
+            f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+        )
+        is_propagated = False
+        try:
+            decode_req.kv_receiver.failure_exception()
+        except Exception as e:
+            error_message += f" with exception {e}"
+            is_propagated = getattr(e, "is_from_another_rank", False)
+        # Mute error message for propagated exceptions to avoid duplicate logging
+        if is_propagated:
+            logger.debug(error_message)
+        else:
+            logger.error(error_message)
+        prepare_abort(
+            decode_req.req,
+            error_message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        if self.scheduler.metrics_reporter.enable_metrics:
+            self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
@@ -856,11 +867,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        pp_consensus: Optional[PPConsensus] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """Pop requests, optionally applying an authoritative PP consensus."""
+        use_pp_consensus = self.scheduler.ps.pp_size > 1 and pp_consensus is not None
+        if use_pp_consensus and rids_to_check is not None:
+            raise ValueError(
+                "rids_to_check cannot be combined with a PP consensus result"
+            )
+
         self._resolve_pending_reqs()
-        self._update_handshake_waiters(rids_to_check)
+        if not use_pp_consensus:
+            self._update_handshake_waiters(rids_to_check)
 
         failed_reqs = []
         preallocated_reqs = []
@@ -901,9 +921,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
+        pp_ready_rids: Optional[set[str]] = None
+        pp_failed_rids: Optional[set[str]] = None
+        if use_pp_consensus:
+            assert pp_consensus is not None
+            ready_rids, failed_rids = pp_consensus
+            pp_failed_rids = set(failed_rids)
+            pp_ready_rids = set(ready_rids) - pp_failed_rids
+            for decode_req in self.queue:
+                rid = decode_req.req.rid
+                if rid in pp_failed_rids:
+                    self._abort_handshake(decode_req, failed_by_pp=True)
+                elif rid in pp_ready_rids:
+                    decode_req.waiting_for_input = True
+                    decode_req.req.time_stats.set_bootstrap_done_time()
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
-            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+            rid = decode_req.req.rid
+            if pp_failed_rids is not None:
+                if rid not in pp_failed_rids:
+                    continue
+            elif rids_to_check is not None and rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                 if not getattr(decode_req.req, "finished_output", False):
@@ -941,7 +980,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
-            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+            rid = decode_req.req.rid
+            if pp_ready_rids is not None:
+                if rid not in pp_ready_rids:
+                    continue
+            elif rids_to_check is not None and rid not in rids_to_check:
                 continue
 
             if i in indices_to_remove:
@@ -1844,6 +1887,38 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             server_args=self.scheduler.server_args,
         )
 
+    def get_finished_rids(self) -> Tuple[List[str], List[str]]:
+        """Return locally finished transfer rids as (successful, failed)."""
+        if not self.queue:
+            return [], []
+
+        if self.scheduler.enable_decode_hicache:
+            self._process_hicache_local_restores(self.queue)
+
+        if self.enable_staging:
+            polls = self._poll_with_staging()
+        else:
+            polls = self._poll_with_metadata_gate()
+
+        successful_rids: List[str] = []
+        failed_rids: List[str] = []
+        for decode_req, poll in zip(self.queue, polls):
+            hicache_restore_status = decode_req.hicache_restore_status
+            if (
+                poll == KVPoll.Failed
+                or hicache_restore_status == HiCacheRestoreResult.FAILED
+            ):
+                failed_rids.append(decode_req.req.rid)
+            elif poll == KVPoll.Success:
+                if (
+                    self.scheduler.enable_decode_hicache
+                    and hicache_restore_status == HiCacheRestoreResult.PENDING
+                ):
+                    continue
+                successful_rids.append(decode_req.req.rid)
+
+        return successful_rids, failed_rids
+
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -1855,11 +1930,27 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+    def pop_transferred(
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        pp_consensus: Optional[PPConsensus] = None,
+    ) -> List[Req]:
+        """Pop finished transfers, optionally applying a PP consensus result.
+
+        In PP mode, the consensus is authoritative. Re-polling local state here
+        can make stages apply different outcomes when a failure or abort arrives
+        between consensus and queue processing.
+        """
+        use_pp_consensus = self.scheduler.ps.pp_size > 1 and pp_consensus is not None
+        if use_pp_consensus and rids_to_check is not None:
+            raise ValueError(
+                "rids_to_check cannot be combined with a PP consensus result"
+            )
+
         if not self.queue:
             return []
 
-        if self.scheduler.enable_decode_hicache:
+        if self.scheduler.enable_decode_hicache and not use_pp_consensus:
             self._process_hicache_local_restores(
                 [
                     decode_req
@@ -1868,7 +1959,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ]
             )
 
-        if self.enable_staging:
+        if use_pp_consensus:
+            assert pp_consensus is not None
+            polls = get_pp_consensus_polls(
+                (decode_req.req.rid for decode_req in self.queue),
+                KVPoll.Success,
+                pp_consensus,
+            )
+        elif self.enable_staging:
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
@@ -1876,6 +1974,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+            if poll is None:
+                continue
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
@@ -2151,7 +2251,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
-                if self.server_args.disaggregation_decode_enable_radix_cache:
+                if get_disagg().disaggregation_decode_enable_radix_cache:
                     tree_cache = self.tree_cache if req.last_node is None else None
                 else:
                     tree_cache = self.tree_cache
@@ -2191,7 +2291,7 @@ class SchedulerDisaggregationDecodeMixin:
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
-        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+        if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
@@ -2203,9 +2303,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
-            self.polling_interval = (
-                self.server_args.disaggregation_decode_polling_interval
-            )
+            self.polling_interval = get_disagg().disaggregation_decode_polling_interval
 
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 

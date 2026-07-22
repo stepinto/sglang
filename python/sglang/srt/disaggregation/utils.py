@@ -5,7 +5,17 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    overload,
+)
 
 import numpy as np
 import torch
@@ -82,6 +92,35 @@ class DisaggregationMode(Enum):
 #########################
 # Synchronization
 #########################
+
+PPConsensus = List[List[str]]
+
+
+def get_pp_consensus_polls(
+    rids: Iterable[str],
+    ready_poll: KVPoll,
+    consensus: Optional[PPConsensus],
+) -> Optional[List[Optional[KVPoll]]]:
+    """Map a PP consensus decision to per-request authoritative poll states."""
+    if consensus is None:
+        return None
+
+    ready_rids, failed_rids = consensus
+    poll_by_rid = {rid: ready_poll for rid in ready_rids}
+    poll_by_rid.update({rid: KVPoll.Failed for rid in failed_rids})
+    return [poll_by_rid.get(rid) for rid in rids]
+
+
+def merge_pp_consensus(
+    previous: Optional[PPConsensus],
+    local_ready_rids: Sequence[str],
+    local_failed_rids: Sequence[str],
+) -> PPConsensus:
+    """Intersect ready requests and union failures across PP stages."""
+    previous_ready, previous_failed = previous or (local_ready_rids, [])
+    failed = set(previous_failed) | set(local_failed_rids)
+    ready = (set(previous_ready) & set(local_ready_rids)) - failed
+    return [list(ready), list(failed)]
 
 
 def _get_failure_prob() -> float:

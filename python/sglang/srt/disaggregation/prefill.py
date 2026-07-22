@@ -37,10 +37,12 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
+    PPConsensus,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_pp_consensus_polls,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
@@ -64,6 +66,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -333,13 +336,13 @@ class PrefillBootstrapQueue:
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
-        rids_to_check: Optional[List[str]] = None,
-    ) -> List[Req]:
+        pp_consensus: Optional[PPConsensus] = None,
+    ) -> List[Req] | tuple[List[Req], List[Req]]:
         """
         pop the reqs which has finished bootstrapping
 
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
-        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
+        pp_consensus: Authoritative PP result as [ready_rids, failed_rids].
         """
 
         bootstrapped_reqs = []
@@ -352,21 +355,22 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.queue],
-            self.scheduler.attn_cp_cpu_group,
-            self.scheduler.attn_tp_cpu_group,
-        )
+        polls = None
+        if self.pp_size > 1 and pp_consensus is not None:
+            polls = get_pp_consensus_polls(
+                (req.rid for req in self.queue),
+                KVPoll.WaitingForInput,
+                pp_consensus,
+            )
+        if polls is None:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.queue],
+                self.scheduler.attn_cp_cpu_group,
+                self.scheduler.attn_tp_cpu_group,
+            )
 
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
-            if (
-                rids_to_check is not None
-                and req.rid not in rids_to_check
-                and poll != KVPoll.Failed
-            ):
-                # In PP mode, successful bootstrap still requires cross-rank
-                # consensus. Local failures are terminal and must be drained
-                # even if an earlier PP rank has already removed the request.
+            if poll is None:
                 continue
 
             if poll == KVPoll.Failed:
@@ -1181,7 +1185,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def optimistic_release_and_requeue(self: Scheduler, req: Req) -> None:
         """Release KV cache and requeue an optimistic prefill request."""
-        max_attempts = self.server_args.optimistic_prefill_attempts
+        max_attempts = get_disagg().optimistic_prefill_attempts
         maybe_cache_unfinished_req(req, self.tree_cache)
         release_kv_cache(req, self.tree_cache)
         req.reset_for_retract()
