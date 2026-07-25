@@ -4175,6 +4175,10 @@ class Scheduler(
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
+                # Skip disagg-decode running reqs: filtering mid-spec-cycle
+                # invalidates EAGLE CUDA graph input tensors (OOB gather).
+                if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    continue
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
