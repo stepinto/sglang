@@ -622,11 +622,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # every subsequent column. Other topk=1 paths retain the token list and
         # assemble it with one final cat instead of launching a copy per step.
         draft_tokens_topk1 = None
+        disable_fused_topk1 = envs.SGLANG_EAGLE_DISABLE_FUSED_TOPK1.get()
         if (
             topk1_chain_fits
             and _is_cuda
             and self.hot_token_id is None
             and not self.server_args.speculative_use_rejection_sampling
+            and not disable_fused_topk1
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -708,7 +710,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_probs_list.append(probs)
                 local_positions.add_(1)
             elif self.topk == 1 and not _is_hip:
-                if _is_cuda:
+                if _is_cuda and not disable_fused_topk1:
                     # The positions advance is fused into the kernel.
                     topk_p, topk_index = draft_topk1_postprocess(
                         next_token_logits,
