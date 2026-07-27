@@ -791,12 +791,12 @@ class Envs:
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
-    # Debug-only: skip the fused topk=1 draft-postprocess path introduced by
-    # PR #30947 and fall back to torch.argmax + select_top_k_tokens +
-    # organize_draft_results. Use to A/B-test whether the fused kernel or its
-    # pre-allocated parent/score index buffers are causing wrong draft tokens
-    # (e.g. low accept rate on GLM/DSV4 MTP).
-    SGLANG_EAGLE_DISABLE_FUSED_TOPK1 = EnvBool(False)
+    # Skip the fused topk=1 draft-postprocess path introduced by PR #30947 and
+    # fall back to torch.argmax + select_top_k_tokens + organize_draft_results.
+    # Default ON: the fused kernel is suspected of causing low draft accept
+    # rate on GLM/DSV4 MTP under disagg-decode + HiCache. Set to False to
+    # re-enable the fused path (perf win, but risk regression).
+    SGLANG_EAGLE_DISABLE_FUSED_TOPK1 = EnvBool(True)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
