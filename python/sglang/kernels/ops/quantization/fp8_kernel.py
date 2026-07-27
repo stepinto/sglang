@@ -542,7 +542,23 @@ def _run_per_token_group_quant_8bit_kernel(
     checks. Whole-row (per-token) quantization is a different op:
     ``sglang_per_token_quant_fp8``.
     """
-    if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
+    # Functional revert of PR #30924 on the CUDA path: always route to the
+    # deprecated v2 JIT kernel (`per_token_group_quant_8bit_v2`) for every
+    # case v2 supports (fp8_e4m3/int8 output, UE8M0 packed int32 or fp32
+    # scale, fused silu, masked). The new trait-driven kernel from #30924 is
+    # suspected of Hopper accuracy regression (author's own note: "flat load
+    # tiling fixed at 32B/lane (Hopper regression fix)" plus 66 non-bit-exact
+    # vs AOT cases outside CI), causing GLM 5.2 NVFP4 MTP accept-rate drop.
+    # A hard `git revert` fails because later PRs finalized the kernel-
+    # namespace migration; this dispatcher short-circuit is the equivalent
+    # behavioral revert. group_size=256 is only supported by the new kernel
+    # (see _V3_KERNEL_SUPPORTED_GROUP_SIZES vs _MUSA_KERNEL_SUPPORTED_GROUP_SIZES),
+    # so fall through in that case.
+    _use_v2 = (
+        not _is_musa
+        and group_size in _MUSA_KERNEL_SUPPORTED_GROUP_SIZES
+    )
+    if (scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa) or _use_v2:
         from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit_v2 import (
             per_token_group_quant_8bit_v2,
         )
