@@ -1013,20 +1013,56 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    # Default plain-silu path: the unified JIT masked fused quant. It allocates
-    # the outputs itself, with scales directly in the layout deep_gemm consumes
-    # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise),
-    # so the caller's get_mn_major transform short-circuits.
-    expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
-    return per_token_group_quant(
-        gateup_output,
+    # Default plain-silu path.
+    #
+    # Functional revert of PR #30924 for the EP-MoE fused-silu-mul-quant path:
+    # the unified JIT ``per_token_group_quant`` kernel has two known Hopper
+    # bugs (scale-tensor use-after-free from returning non-owning views for
+    # already-aligned scales; missing non-finite quant sanitization -- NaNs
+    # propagate to fp8 NaN codes instead of saturating). Both are fixed
+    # upstream in PR #32188 + PR #32296 but not in this branch. Bypass the
+    # unified JIT and use the deprecated-but-bug-free v2 kernel, which has
+    # full feature parity for (fuse_silu_and_mul + masked_m + scale_ue8m0 +
+    # column-major output_s). We allocate the output_s in the exact layout
+    # deep_gemm consumes (packed-int32 col-major for UE8M0, TMA-aligned
+    # col-major fp32 otherwise) so the caller's get_mn_major transform still
+    # short-circuits. ``expected_m`` (a PR #30924 grid-bound optimization) is
+    # dropped; v2 uses ``tokens_pad`` as the grid bound, numerically
+    # identical and only marginally slower.
+    from sglang.kernels.ops.quantization._jit_per_token_group_quant_8bit_v2 import (
+        per_token_group_quant_8bit_v2,
+    )
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        create_per_token_group_quant_fp8_output_scale,
+        fp8_max as _fp8_max,
+        fp8_min as _fp8_min,
+    )
+
+    out_q_shape = (E, N, D)
+    down_input = torch.empty(
+        out_q_shape, device=hidden_states_device, dtype=torch.float8_e4m3fn
+    )
+    down_input_scale = create_per_token_group_quant_fp8_output_scale(
+        x_shape=out_q_shape,
+        device=hidden_states_device,
         group_size=group_size,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+    per_token_group_quant_8bit_v2(
+        input=gateup_output,
+        output_q=down_input,
+        output_s=down_input_scale,
+        group_size=group_size,
+        eps=1e-10,
+        min_8bit=_fp8_min,
+        max_8bit=_fp8_max,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         fuse_silu_and_mul=True,
         masked_m=masked_m,
-        expected_m=expected_m,
-        column_major_scales=True,
     )
+    return down_input, down_input_scale
 
 
 def _apply_swiglu_limit(
