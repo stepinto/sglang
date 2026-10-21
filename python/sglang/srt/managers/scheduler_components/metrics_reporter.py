@@ -262,6 +262,7 @@ class SchedulerMetricsReporter:
     def _init_metrics(self):
         # Basic stats
         self.forward_ct_decode = 0
+        self.scheduler_loop_count = 0
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
@@ -840,6 +841,7 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.scheduler_loop_count = self.scheduler_loop_count
             # Refresh here too: prefill-heavy stretches can run long between
             # decode-stats ticks, and the gauge must decay rather than hold.
             self.stats.gen_throughput = self._current_gen_throughput(now)
@@ -1058,6 +1060,7 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
+            self.stats.scheduler_loop_count = self.scheduler_loop_count
             # cache_hit_rate is prefill-owned (per-report semantics); decode
             # ticks must not reset it, or the exported gauge reads 0 whenever
             # a decode report lands between prefill reports.

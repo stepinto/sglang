@@ -1978,6 +1978,7 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+            self.metrics_reporter.scheduler_loop_count += 1
 
             # Receive requests
             self.ingest_requests()
@@ -2023,6 +2024,7 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+            self.metrics_reporter.scheduler_loop_count += 1
 
             # Receive requests
             self.ingest_requests()

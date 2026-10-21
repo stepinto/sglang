@@ -137,6 +137,7 @@ class SchedulerStats:
     # PD disaggregation
     num_prefill_bootstrap_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    scheduler_loop_count: int = 0
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_host_receive_queue_reqs: QueueCount = field(default_factory=QueueCount)
@@ -349,6 +350,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
+        self._last_scheduler_loop_count = 0
 
         # =================================================================
         # Basics
@@ -582,6 +584,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of requests in the prefill inflight queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        self.scheduler_loop_count = Counter(
+            name="sglang:scheduler_loop_count_total",
+            documentation="Cumulative number of scheduler loop iterations.",
+            labelnames=labels.keys(),
         )
         self.num_decode_prealloc_queue_reqs = Gauge(
             name="sglang:num_decode_prealloc_queue_reqs",
@@ -1656,6 +1663,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge_queue_count(
             self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
         )
+        self.scheduler_loop_count.labels(**self.labels).inc(
+            stats.scheduler_loop_count - self._last_scheduler_loop_count
+        )
+        self._last_scheduler_loop_count = stats.scheduler_loop_count
         self._log_gauge_queue_count(
             self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
         )

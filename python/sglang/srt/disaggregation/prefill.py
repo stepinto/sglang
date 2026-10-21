@@ -664,6 +664,7 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             if self.gracefully_exit:
                 break
+            self.metrics_reporter.scheduler_loop_count += 1
 
             # Receive requests
             self.ingest_requests()
@@ -750,6 +751,7 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             if self.gracefully_exit:
                 break
+            self.metrics_reporter.scheduler_loop_count += 1
 
             # Stop dispatching at pause requests while waiting for a batch result.
             received_inputs = self.ingest_requests(
